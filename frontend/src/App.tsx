@@ -31,6 +31,7 @@ import {
 } from './api';
 import {
   bytesToArrayBuffer,
+  bytesToBase64Url,
   decryptBytes,
   decryptIndex,
   emptyIndex,
@@ -59,9 +60,27 @@ const textDecoder = new TextDecoder();
 const retentionMs = 30 * 24 * 60 * 60 * 1000;
 const maxClientPlainBytes = 50 * 1024 * 1024 - 64;
 const cryptoUnavailable = webCryptoUnavailableReason();
+const syncEnabledStorageKey = 'openlist-clipboard.sync.enabled.v1';
+const syncStateStorageKey = 'openlist-clipboard.sync.state.v1';
 
 type LiveState = 'offline' | 'connecting' | 'live';
 type IndexStream = { close: () => void };
+type SyncReason = 'enable' | 'focus' | 'visibility' | 'remote' | 'clipboardchange';
+type ClipboardSnapshot = {
+  kind: 'text' | 'image';
+  bytes: Uint8Array;
+  name: string;
+  mime: string;
+  preview: string;
+  hash: string;
+};
+type StoredSyncState = {
+  localHash?: string;
+  localObservedAt?: number;
+  remoteClipId?: string;
+  remoteHash?: string;
+  remoteCopiedAt?: number;
+};
 
 export default function App() {
   const [groups, setGroups] = createSignal<SavedGroup[]>([]);
@@ -79,6 +98,7 @@ export default function App() {
   const [showInviteQR, setShowInviteQR] = createSignal(false);
   const [scannerOpen, setScannerOpen] = createSignal(false);
   const [liveState, setLiveState] = createSignal<LiveState>('offline');
+  const [clipboardSyncEnabled, setClipboardSyncEnabled] = createSignal(false);
 
   let scannerVideo: HTMLVideoElement | undefined;
   let scannerCanvas: HTMLCanvasElement | undefined;
@@ -89,6 +109,8 @@ export default function App() {
   let indexEventsVersion = 0;
   let liveRefreshRunning = false;
   let queuedIndexHash = '';
+  let clipboardSyncRunning = false;
+  let queuedClipboardSyncReason: SyncReason | null = null;
 
   const unlocked = createMemo(() => activeGroup() !== null);
   const activeClips = createMemo(() => index().clips.filter((clip) => !isExpired(clip)).sort((a, b) => b.createdAt - a.createdAt));
@@ -97,6 +119,9 @@ export default function App() {
     window.addEventListener('paste', handlePaste);
     window.addEventListener('dragover', preventDefault);
     window.addEventListener('drop', handleDrop);
+    window.addEventListener('focus', handleWindowFocus);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    clipboardEventTarget()?.addEventListener('clipboardchange', handleClipboardChange);
     if (cryptoUnavailable) {
       setError(cryptoUnavailable);
     }
@@ -121,6 +146,9 @@ export default function App() {
     window.removeEventListener('paste', handlePaste);
     window.removeEventListener('dragover', preventDefault);
     window.removeEventListener('drop', handleDrop);
+    window.removeEventListener('focus', handleWindowFocus);
+    document.removeEventListener('visibilitychange', handleVisibilityChange);
+    clipboardEventTarget()?.removeEventListener('clipboardchange', handleClipboardChange);
     closeIndexEvents();
     stopInviteScanner();
     Object.values(previewUrls()).forEach(URL.revokeObjectURL);
@@ -157,17 +185,22 @@ export default function App() {
     const opened = await activateGroup(saved);
     closeIndexEvents();
     clearPreviewUrls();
+    clearQueuedClipboardSync();
     setActiveGroup(opened);
+    setClipboardSyncEnabled(loadSyncEnabled(opened.id));
     saveActiveGroupId(opened.id);
     setIndex(emptyIndex());
     setBaseHash('');
     await loadIndex(opened);
+    requestClipboardSync('focus');
   }
 
   function leaveGroup() {
     closeIndexEvents();
     clearPreviewUrls();
+    clearQueuedClipboardSync();
     setActiveGroup(null);
+    setClipboardSyncEnabled(false);
     saveActiveGroupId('');
     setIndex(emptyIndex());
     setBaseHash('');
@@ -356,6 +389,7 @@ export default function App() {
         }
         if (changed) {
           setStatus('已实时更新');
+          requestClipboardSync('remote');
         }
       } catch (err) {
         if (version === indexEventsVersion) {
@@ -433,7 +467,7 @@ export default function App() {
     }, '已上传');
   }
 
-  async function addPlainBytes(input: { bytes: Uint8Array; kind: ClipEntry['kind']; name: string; mime: string; preview: string }) {
+  async function addPlainBytes(input: { bytes: Uint8Array; kind: ClipEntry['kind']; name: string; mime: string; preview: string }): Promise<ClipEntry> {
     const group = requireGroup();
     if (input.bytes.byteLength > maxClientPlainBytes) {
       throw new Error(`单条内容不能超过 ${formatSize(maxClientPlainBytes)}，请拆成更小的内容后再保存。`);
@@ -460,6 +494,7 @@ export default function App() {
       updatedAt: now,
       clips: [clip, ...index().clips]
     }, group);
+    return clip;
   }
 
   async function readClipboard() {
@@ -505,6 +540,274 @@ export default function App() {
       }
       downloadPlain(clip, plain);
     }, clip.kind === 'file' ? '已下载' : '已复制');
+  }
+
+  function toggleClipboardSync(enabled: boolean) {
+    const group = activeGroup();
+    if (!group) {
+      return;
+    }
+    setClipboardSyncEnabled(enabled);
+    saveSyncEnabled(group.id, enabled);
+    clearQueuedClipboardSync();
+    if (enabled) {
+      setStatus('剪贴板前台同步已开启');
+      requestClipboardSync('enable');
+    } else {
+      setStatus('剪贴板前台同步已关闭');
+    }
+  }
+
+  function handleWindowFocus() {
+    requestClipboardSync('focus');
+  }
+
+  function handleVisibilityChange() {
+    if (document.visibilityState === 'visible') {
+      requestClipboardSync('visibility');
+    }
+  }
+
+  function handleClipboardChange() {
+    requestClipboardSync('clipboardchange');
+  }
+
+  function requestClipboardSync(reason: SyncReason) {
+    const group = activeGroup();
+    if (!group || !clipboardSyncEnabled() || cryptoUnavailable || !canAttemptForegroundSync()) {
+      return;
+    }
+    if (clipboardSyncRunning) {
+      queuedClipboardSyncReason = reason;
+      return;
+    }
+    clipboardSyncRunning = true;
+    const groupID = group.id;
+    void (async () => {
+      try {
+        await syncClipboardNow(reason, groupID);
+      } catch (err) {
+        if (activeGroup()?.id === groupID && clipboardSyncEnabled()) {
+          setError(clipboardSyncError(err));
+        }
+      } finally {
+        clipboardSyncRunning = false;
+        const queued = queuedClipboardSyncReason;
+        queuedClipboardSyncReason = null;
+        if (queued && activeGroup()?.id === groupID && clipboardSyncEnabled()) {
+          requestClipboardSync(queued);
+        }
+      }
+    })();
+  }
+
+  function clearQueuedClipboardSync() {
+    queuedClipboardSyncReason = null;
+  }
+
+  async function syncClipboardNow(reason: SyncReason, groupID: string) {
+    const group = activeGroup();
+    if (!group || group.id !== groupID) {
+      return;
+    }
+    if (reason !== 'remote') {
+      await refreshIndex(group);
+    }
+
+    const latest = activeClips()[0];
+    if (reason === 'remote') {
+      if (latest) {
+        await copyRemoteClipToClipboard(latest, groupID);
+      }
+      return;
+    }
+
+    const state = loadSyncState(groupID);
+    let snapshot: ClipboardSnapshot | null;
+    try {
+      snapshot = await readClipboardSnapshot();
+    } catch (err) {
+      if (latest) {
+        await copyRemoteClipToClipboard(latest, groupID);
+        return;
+      }
+      throw err;
+    }
+    const observedAt = snapshot
+      ? snapshot.hash === state.localHash && state.localObservedAt
+        ? state.localObservedAt
+        : Date.now()
+      : state.localObservedAt || 0;
+
+    if (snapshot) {
+      saveSyncState(groupID, {
+        ...state,
+        localHash: snapshot.hash,
+        localObservedAt: observedAt
+      });
+    }
+
+    if (!latest) {
+      if (snapshot) {
+        await uploadClipboardSnapshot(snapshot, groupID);
+      }
+      return;
+    }
+
+    if (snapshot) {
+      if (state.remoteClipId === latest.id && snapshot.hash === state.remoteHash) {
+        return;
+      }
+      if (latest.kind !== 'file') {
+        const latestHash = await clipPlainHash(latest);
+        if (snapshot.hash === latestHash) {
+          saveSyncState(groupID, {
+            ...state,
+            localHash: snapshot.hash,
+            localObservedAt: latest.createdAt,
+            remoteClipId: latest.id,
+            remoteHash: latestHash
+          });
+          return;
+        }
+      }
+    }
+
+    if (snapshot && observedAt > latest.createdAt) {
+      await uploadClipboardSnapshot(snapshot, groupID);
+      return;
+    }
+
+    await copyRemoteClipToClipboard(latest, groupID);
+  }
+
+  async function uploadClipboardSnapshot(snapshot: ClipboardSnapshot, groupID: string) {
+    const group = activeGroup();
+    if (!group || group.id !== groupID) {
+      return;
+    }
+    const clip = await addPlainBytes({
+      bytes: snapshot.bytes,
+      kind: snapshot.kind,
+      name: snapshot.name,
+      mime: snapshot.mime,
+      preview: snapshot.preview
+    });
+    const state = loadSyncState(groupID);
+    saveSyncState(groupID, {
+      ...state,
+      localHash: snapshot.hash,
+      localObservedAt: clip.createdAt,
+      remoteClipId: clip.id,
+      remoteHash: snapshot.hash
+    });
+    setStatus('已同步本机剪贴板');
+  }
+
+  async function copyRemoteClipToClipboard(clip: ClipEntry, groupID: string) {
+    const group = activeGroup();
+    if (!group || group.id !== groupID) {
+      return;
+    }
+    if (clip.kind === 'file') {
+      setStatus('最新内容是文件，浏览器不能自动写入系统剪贴板');
+      return;
+    }
+    const state = loadSyncState(groupID);
+    if (state.remoteClipId === clip.id && state.remoteHash && state.localHash === state.remoteHash) {
+      return;
+    }
+
+    const plain = await plainBytes(clip);
+    const hash = await sha256Base64Url(plain);
+    const nav = requireClipboardAccess();
+    if (clip.kind === 'text') {
+      await nav.writeText(textDecoder.decode(plain));
+    } else if (clip.kind === 'image' && 'ClipboardItem' in window && typeof nav.write === 'function') {
+      const blob = new Blob([bytesToArrayBuffer(plain)], { type: clip.mime || 'image/png' });
+      await nav.write([new ClipboardItem({ [blob.type]: blob })]);
+    } else {
+      setStatus('此浏览器不能自动写入图片剪贴板');
+      return;
+    }
+
+    saveSyncState(groupID, {
+      ...state,
+      localHash: hash,
+      localObservedAt: clip.createdAt,
+      remoteClipId: clip.id,
+      remoteHash: hash,
+      remoteCopiedAt: Date.now()
+    });
+    setStatus('已同步到系统剪贴板');
+  }
+
+  async function clipPlainHash(clip: ClipEntry) {
+    return sha256Base64Url(await plainBytes(clip));
+  }
+
+  async function readClipboardSnapshot(): Promise<ClipboardSnapshot | null> {
+    const nav = requireClipboardAccess();
+    let richReadError: unknown;
+    if (typeof nav.read === 'function') {
+      try {
+        const items = await nav.read();
+        for (const item of items) {
+          const imageType = item.types.find((type) => type.startsWith('image/'));
+          if (imageType) {
+            const blob = await item.getType(imageType);
+            const bytes = new Uint8Array(await blob.arrayBuffer());
+            return {
+              kind: 'image',
+              bytes,
+              name: `clipboard-${Date.now()}.${imageExtension(imageType)}`,
+              mime: imageType,
+              preview: '图片',
+              hash: await sha256Base64Url(bytes)
+            };
+          }
+        }
+        for (const item of items) {
+          if (item.types.includes('text/plain')) {
+            const blob = await item.getType('text/plain');
+            const text = await blob.text();
+            if (text.trim()) {
+              const bytes = textEncoder.encode(text);
+              return {
+                kind: 'text',
+                bytes,
+                name: '文本',
+                mime: 'text/plain;charset=utf-8',
+                preview: text.slice(0, 160),
+                hash: await sha256Base64Url(bytes)
+              };
+            }
+          }
+        }
+      } catch (err) {
+        richReadError = err;
+      }
+    }
+
+    if (typeof nav.readText !== 'function') {
+      if (richReadError) {
+        throw richReadError;
+      }
+      throw new Error('当前浏览器不支持读取剪贴板');
+    }
+    const text = await nav.readText();
+    if (!text.trim()) {
+      return null;
+    }
+    const bytes = textEncoder.encode(text);
+    return {
+      kind: 'text',
+      bytes,
+      name: '文本',
+      mime: 'text/plain;charset=utf-8',
+      preview: text.slice(0, 160),
+      hash: await sha256Base64Url(bytes)
+    };
   }
 
   async function downloadClip(clip: ClipEntry) {
@@ -676,6 +979,15 @@ export default function App() {
           </Show>
           <Show when={unlocked()}>
             <span class={`live-pill ${liveState()}`}>{liveStateLabel(liveState())}</span>
+            <label class={`sync-toggle ${clipboardSyncEnabled() ? 'enabled' : ''}`} title="前台剪贴板同步">
+              <input
+                type="checkbox"
+                checked={clipboardSyncEnabled()}
+                onChange={(event) => toggleClipboardSync(event.currentTarget.checked)}
+              />
+              <span class="sync-switch" />
+              <span>同步</span>
+            </label>
             <button class="icon-button" title="刷新" disabled={busy()} onClick={() => void run(() => loadIndex(), '已刷新')}>
               <RefreshCw size={18} />
             </button>
@@ -872,6 +1184,112 @@ function isTyping() {
     return false;
   }
   return ['INPUT', 'TEXTAREA', 'SELECT'].includes(element.tagName) || (element as HTMLElement).isContentEditable;
+}
+
+function canAttemptForegroundSync() {
+  return document.visibilityState === 'visible' && document.hasFocus();
+}
+
+function clipboardEventTarget(): (EventTarget & {
+  addEventListener: EventTarget['addEventListener'];
+  removeEventListener: EventTarget['removeEventListener'];
+}) | null {
+  const clipboard = navigator.clipboard as unknown as
+    | (EventTarget & {
+        addEventListener?: EventTarget['addEventListener'];
+        removeEventListener?: EventTarget['removeEventListener'];
+      })
+    | undefined;
+  if (!clipboard || typeof clipboard.addEventListener !== 'function' || typeof clipboard.removeEventListener !== 'function') {
+    return null;
+  }
+  return clipboard as EventTarget & {
+    addEventListener: EventTarget['addEventListener'];
+    removeEventListener: EventTarget['removeEventListener'];
+  };
+}
+
+function requireClipboardAccess(): Clipboard & {
+  read?: () => Promise<ClipboardItem[]>;
+} {
+  if (!navigator.clipboard) {
+    throw new Error('当前浏览器未开放剪贴板能力，请使用 HTTPS 或 localhost 访问。');
+  }
+  return navigator.clipboard as Clipboard & {
+    read?: () => Promise<ClipboardItem[]>;
+  };
+}
+
+async function sha256Base64Url(bytes: Uint8Array) {
+  const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', bytesToArrayBuffer(bytes)));
+  return bytesToBase64Url(hash);
+}
+
+function imageExtension(mime: string) {
+  const subtype = mime.split('/')[1]?.split('+')[0]?.replace(/[^A-Za-z0-9_-]/g, '');
+  return subtype || 'png';
+}
+
+function loadSyncEnabled(groupID: string) {
+  return readStorageObject(syncEnabledStorageKey)[groupID] === true;
+}
+
+function saveSyncEnabled(groupID: string, enabled: boolean) {
+  const current = readStorageObject(syncEnabledStorageKey);
+  if (enabled) {
+    current[groupID] = true;
+  } else {
+    delete current[groupID];
+  }
+  writeStorageObject(syncEnabledStorageKey, current);
+}
+
+function loadSyncState(groupID: string): StoredSyncState {
+  const state = readStorageObject(syncStateStorageKey)[groupID];
+  if (!state || typeof state !== 'object' || Array.isArray(state)) {
+    return {};
+  }
+  return state as StoredSyncState;
+}
+
+function saveSyncState(groupID: string, state: StoredSyncState) {
+  const current = readStorageObject(syncStateStorageKey);
+  current[groupID] = {
+    localHash: state.localHash,
+    localObservedAt: state.localObservedAt,
+    remoteClipId: state.remoteClipId,
+    remoteHash: state.remoteHash,
+    remoteCopiedAt: state.remoteCopiedAt
+  };
+  writeStorageObject(syncStateStorageKey, current);
+}
+
+function readStorageObject(key: string): Record<string, unknown> {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) {
+      return {};
+    }
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeStorageObject(key: string, value: Record<string, unknown>) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // Local storage can be unavailable in private browsing or strict site settings.
+  }
+}
+
+function clipboardSyncError(err: unknown) {
+  if (err instanceof DOMException && (err.name === 'NotAllowedError' || err.name === 'SecurityError')) {
+    return '浏览器拒绝剪贴板同步。请确认页面在前台，并允许此站点读取/写入剪贴板。';
+  }
+  return displayError(err);
 }
 
 function displayError(err: unknown) {

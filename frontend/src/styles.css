@@ -87,6 +87,11 @@ button:disabled {
   gap: 8px;
 }
 
+.top-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 .auth-panel,
 .key-panel,
 .composer,
@@ -234,6 +239,66 @@ button:hover,
   border-color: #dfc981;
   color: #6b5611;
   background: #fbf2ca;
+}
+
+.sync-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid #cbd7d3;
+  border-radius: 8px;
+  color: #4a5b56;
+  background: #fbfcfb;
+  font-size: 13px;
+  font-weight: 700;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.sync-toggle input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.sync-switch {
+  position: relative;
+  width: 30px;
+  height: 18px;
+  border-radius: 999px;
+  background: #cbd7d3;
+  transition: background 160ms ease;
+}
+
+.sync-switch::after {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 1px 3px rgba(23, 32, 38, 0.25);
+  transition: transform 160ms ease;
+  content: "";
+}
+
+.sync-toggle.enabled {
+  border-color: #96d8bc;
+  color: #135f45;
+  background: #e8f7ef;
+}
+
+.sync-toggle.enabled .sync-switch {
+  background: #1f8d63;
+}
+
+.sync-toggle.enabled .sync-switch::after {
+  transform: translateX(12px);
 }
 
 .danger {
