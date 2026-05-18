@@ -1,0 +1,14 @@
+.env
+.env.local
+.git
+.gitignore
+tmp/
+dist/
+coverage/
+*.log
+*.exe
+*.test
+*.zip
+
+frontend/dist/
+frontend/node_modules/

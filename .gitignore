@@ -1,0 +1,11 @@
+.env
+.env.local
+dist/
+frontend/dist/
+frontend/node_modules/
+coverage/
+*.log
+*.exe
+*.test
+*.zip
+tmp/

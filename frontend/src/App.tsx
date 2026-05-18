@@ -1,0 +1,920 @@
+import {
+  Camera,
+  Clipboard as ClipboardIcon,
+  Copy,
+  Download,
+  Eye,
+  FileIcon,
+  FileText,
+  ImageIcon,
+  KeyRound,
+  LogOut,
+  Pin,
+  PinOff,
+  Plus,
+  QrCode,
+  RefreshCw,
+  Trash2,
+  Upload,
+  Users,
+  X
+} from 'lucide-solid';
+import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from 'solid-js';
+import {
+  createRemoteGroup,
+  deleteBlob,
+  downloadBlob,
+  fetchIndex,
+  openIndexEvents,
+  saveIndex,
+  uploadBlob
+} from './api';
+import {
+  bytesToArrayBuffer,
+  decryptBytes,
+  decryptIndex,
+  emptyIndex,
+  encryptBytes,
+  encryptIndex,
+  mergeIndexes,
+  webCryptoUnavailableReason
+} from './crypto';
+import {
+  activateGroup,
+  activeGroupId,
+  createSavedGroup,
+  isInviteText,
+  loadSavedGroups,
+  removeGroup,
+  saveActiveGroupId,
+  saveSavedGroups,
+  savedGroupFromInvite,
+  upsertGroup
+} from './groups';
+import { decodeQRCodeFromCanvas, qrCodeDataURL } from './qr';
+import type { ActiveGroup, ClipEntry, ClipIndex, IndexEvent, SavedGroup } from './types';
+
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+const retentionMs = 30 * 24 * 60 * 60 * 1000;
+const maxClientPlainBytes = 50 * 1024 * 1024 - 64;
+const cryptoUnavailable = webCryptoUnavailableReason();
+
+type LiveState = 'offline' | 'connecting' | 'live';
+type IndexStream = { close: () => void };
+
+export default function App() {
+  const [groups, setGroups] = createSignal<SavedGroup[]>([]);
+  const [activeGroup, setActiveGroup] = createSignal<ActiveGroup | null>(null);
+  const [groupName, setGroupName] = createSignal('');
+  const [inviteInput, setInviteInput] = createSignal('');
+  const [index, setIndex] = createSignal<ClipIndex>(emptyIndex());
+  const [baseHash, setBaseHash] = createSignal('');
+  const [textDraft, setTextDraft] = createSignal('');
+  const [busy, setBusy] = createSignal(false);
+  const [status, setStatus] = createSignal('');
+  const [error, setError] = createSignal('');
+  const [previewUrls, setPreviewUrls] = createSignal<Record<string, string>>({});
+  const [inviteQR, setInviteQR] = createSignal('');
+  const [showInviteQR, setShowInviteQR] = createSignal(false);
+  const [scannerOpen, setScannerOpen] = createSignal(false);
+  const [liveState, setLiveState] = createSignal<LiveState>('offline');
+
+  let scannerVideo: HTMLVideoElement | undefined;
+  let scannerCanvas: HTMLCanvasElement | undefined;
+  let scannerStream: MediaStream | null = null;
+  let scannerFrame = 0;
+  let scannerDone = false;
+  let indexStream: IndexStream | null = null;
+  let indexEventsVersion = 0;
+  let liveRefreshRunning = false;
+  let queuedIndexHash = '';
+
+  const unlocked = createMemo(() => activeGroup() !== null);
+  const activeClips = createMemo(() => index().clips.filter((clip) => !isExpired(clip)).sort((a, b) => b.createdAt - a.createdAt));
+
+  onMount(async () => {
+    window.addEventListener('paste', handlePaste);
+    window.addEventListener('dragover', preventDefault);
+    window.addEventListener('drop', handleDrop);
+    if (cryptoUnavailable) {
+      setError(cryptoUnavailable);
+    }
+    const saved = loadSavedGroups();
+    setGroups(saved);
+    const initial = saved.find((group) => group.id === activeGroupId()) || saved[0];
+    if (initial && !cryptoUnavailable) {
+      await run(() => activateExistingGroup(initial), '已打开分组');
+    }
+  });
+
+  createEffect(() => {
+    const group = activeGroup();
+    if (!group) {
+      closeIndexEvents();
+      return;
+    }
+    connectIndexEvents(group);
+  });
+
+  onCleanup(() => {
+    window.removeEventListener('paste', handlePaste);
+    window.removeEventListener('dragover', preventDefault);
+    window.removeEventListener('drop', handleDrop);
+    closeIndexEvents();
+    stopInviteScanner();
+    Object.values(previewUrls()).forEach(URL.revokeObjectURL);
+  });
+
+  async function createGroupAction(event: Event) {
+    event.preventDefault();
+    await run(async () => {
+      const saved = await createSavedGroup(groupName());
+      await createRemoteGroup(saved.id, saved.publicKeyJwk);
+      const next = upsertGroup(groups(), saved);
+      setGroups(next);
+      saveSavedGroups(next);
+      setGroupName('');
+      await activateExistingGroup(saved);
+    }, '分组已创建');
+  }
+
+  async function importGroupAction(event?: Event) {
+    event?.preventDefault();
+    await run(async () => {
+      const saved = await savedGroupFromInvite(inviteInput(), groupName());
+      await createRemoteGroup(saved.id, saved.publicKeyJwk);
+      const next = upsertGroup(groups(), saved);
+      setGroups(next);
+      saveSavedGroups(next);
+      setGroupName('');
+      setInviteInput('');
+      await activateExistingGroup(saved);
+    }, '分组已导入');
+  }
+
+  async function activateExistingGroup(saved: SavedGroup) {
+    const opened = await activateGroup(saved);
+    closeIndexEvents();
+    clearPreviewUrls();
+    setActiveGroup(opened);
+    saveActiveGroupId(opened.id);
+    setIndex(emptyIndex());
+    setBaseHash('');
+    await loadIndex(opened);
+  }
+
+  function leaveGroup() {
+    closeIndexEvents();
+    clearPreviewUrls();
+    setActiveGroup(null);
+    saveActiveGroupId('');
+    setIndex(emptyIndex());
+    setBaseHash('');
+    setTextDraft('');
+  }
+
+  function removeActiveGroup() {
+    const group = activeGroup();
+    if (!group) {
+      return;
+    }
+    const next = removeGroup(groups(), group.id);
+    setGroups(next);
+    saveSavedGroups(next);
+    leaveGroup();
+    setStatus('已从本机移除此分组');
+  }
+
+  async function switchGroup(groupID: string) {
+    const saved = groups().find((group) => group.id === groupID);
+    if (!saved) {
+      return;
+    }
+    await run(() => activateExistingGroup(saved), '已切换分组');
+  }
+
+  async function showInviteCodeQR() {
+    const group = requireGroup();
+    await run(async () => {
+      setInviteQR(await qrCodeDataURL(group.invite));
+      setShowInviteQR(true);
+    }, '二维码已生成');
+  }
+
+  async function startInviteScanner() {
+    if (cryptoUnavailable) {
+      setError(cryptoUnavailable);
+      return;
+    }
+    await run(async () => {
+      setScannerOpen(true);
+      try {
+        await nextAnimationFrame();
+        if (!scannerVideo || !scannerCanvas) {
+          throw new Error('QR scanner is not ready.');
+        }
+        if (!navigator.mediaDevices?.getUserMedia) {
+          throw new Error('Camera scanning is not available in this browser.');
+        }
+        scannerDone = false;
+        scannerStream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: 'environment' } },
+          audio: false
+        });
+        scannerVideo.srcObject = scannerStream;
+        await scannerVideo.play();
+        scannerFrame = requestAnimationFrame(scanInviteFrame);
+      } catch (err) {
+        stopInviteScanner();
+        throw err;
+      }
+    }, '摄像头已打开');
+  }
+
+  function scanInviteFrame() {
+    if (!scannerOpen() || scannerDone || !scannerVideo || !scannerCanvas) {
+      return;
+    }
+    if (scannerVideo.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && scannerVideo.videoWidth > 0) {
+      scannerCanvas.width = scannerVideo.videoWidth;
+      scannerCanvas.height = scannerVideo.videoHeight;
+      const context = scannerCanvas.getContext('2d', { willReadFrequently: true });
+      if (context) {
+        context.drawImage(scannerVideo, 0, 0, scannerCanvas.width, scannerCanvas.height);
+        const decoded = decodeQRCodeFromCanvas(scannerCanvas);
+        if (decoded) {
+          if (!isInviteText(decoded)) {
+            setError('二维码不是有效的分组邀请码');
+          } else {
+            scannerDone = true;
+            stopInviteScanner();
+            setInviteInput(decoded);
+            void importGroupAction();
+            return;
+          }
+        }
+      }
+    }
+    scannerFrame = requestAnimationFrame(scanInviteFrame);
+  }
+
+  function stopInviteScanner() {
+    if (scannerFrame) {
+      cancelAnimationFrame(scannerFrame);
+      scannerFrame = 0;
+    }
+    if (scannerStream) {
+      scannerStream.getTracks().forEach((track) => track.stop());
+      scannerStream = null;
+    }
+    if (scannerVideo) {
+      scannerVideo.srcObject = null;
+    }
+    setScannerOpen(false);
+  }
+
+  async function loadIndex(group = activeGroup()) {
+    if (!group) {
+      return;
+    }
+    await refreshIndex(group, true);
+  }
+
+  async function refreshIndex(group: ActiveGroup, forceCleanup = false): Promise<boolean> {
+    const response = await fetchIndex(group);
+    if (response.hash === baseHash()) {
+      if (forceCleanup) {
+        await cleanupExpired(index(), group, response.hash);
+      }
+      return false;
+    }
+    const decrypted = await decryptIndex(group.vaultCryptoKey, response.blob);
+    setBaseHash(response.hash);
+    setIndex(decrypted);
+    await cleanupExpired(decrypted, group, response.hash);
+    return true;
+  }
+
+  function connectIndexEvents(group: ActiveGroup) {
+    closeIndexEvents();
+    const version = indexEventsVersion + 1;
+    indexEventsVersion = version;
+    queuedIndexHash = '';
+    liveRefreshRunning = false;
+
+    indexStream = openIndexEvents(
+      group,
+      (event) => handleIndexEvent(event, group, version),
+      (state) => {
+        if (version === indexEventsVersion) {
+          setLiveState(state);
+        }
+      },
+      (message) => {
+        if (version === indexEventsVersion) {
+          setError(message);
+        }
+      }
+    );
+  }
+
+  function closeIndexEvents() {
+    indexEventsVersion += 1;
+    queuedIndexHash = '';
+    liveRefreshRunning = false;
+    if (indexStream) {
+      const stream = indexStream;
+      indexStream = null;
+      stream.close();
+    }
+    setLiveState('offline');
+  }
+
+  function handleIndexEvent(event: IndexEvent, group: ActiveGroup, version: number) {
+    if (version !== indexEventsVersion || event.hash === baseHash()) {
+      return;
+    }
+    queueIndexRefresh(group, event.hash, version);
+  }
+
+  function queueIndexRefresh(group: ActiveGroup, nextHash: string, version: number) {
+    if (!nextHash || nextHash === baseHash()) {
+      return;
+    }
+    queuedIndexHash = nextHash;
+    if (liveRefreshRunning) {
+      return;
+    }
+    liveRefreshRunning = true;
+    void (async () => {
+      let changed = false;
+      try {
+        while (version === indexEventsVersion && queuedIndexHash && queuedIndexHash !== baseHash()) {
+          queuedIndexHash = '';
+          changed = (await refreshIndex(group)) || changed;
+        }
+        if (changed) {
+          setStatus('已实时更新');
+        }
+      } catch (err) {
+        if (version === indexEventsVersion) {
+          setError(displayError(err));
+        }
+      } finally {
+        liveRefreshRunning = false;
+        if (version === indexEventsVersion && queuedIndexHash && queuedIndexHash !== baseHash()) {
+          queueIndexRefresh(group, queuedIndexHash, version);
+        }
+      }
+    })();
+  }
+
+  async function persist(next: ClipIndex, group = activeGroup(), hash = baseHash()) {
+    if (!group) {
+      throw new Error('请先打开一个分组');
+    }
+    const encrypted = await encryptIndex(group.vaultCryptoKey, next);
+    try {
+      const saved = await saveIndex(group, hash, encrypted);
+      setIndex(next);
+      setBaseHash(saved.hash);
+      return;
+    } catch (err) {
+      if ((err as Error & { status?: number }).status !== 409) {
+        throw err;
+      }
+    }
+
+    const remote = await fetchIndex(group);
+    const remoteIndex = await decryptIndex(group.vaultCryptoKey, remote.blob);
+    const merged = mergeIndexes(remoteIndex, next);
+    const mergedBlob = await encryptIndex(group.vaultCryptoKey, merged);
+    const saved = await saveIndex(group, remote.hash, mergedBlob);
+    setIndex(merged);
+    setBaseHash(saved.hash);
+  }
+
+  async function addText() {
+    const value = textDraft().trim();
+    if (!value) {
+      return;
+    }
+    await run(async () => {
+      await addPlainBytes({
+        bytes: textEncoder.encode(value),
+        kind: 'text',
+        name: '文本',
+        mime: 'text/plain;charset=utf-8',
+        preview: value.slice(0, 160)
+      });
+      setTextDraft('');
+    }, '已保存');
+  }
+
+  async function addFile(file: File) {
+    await run(async () => {
+      if (file.size > maxClientPlainBytes) {
+        throw new Error(`单条内容不能超过 ${formatSize(maxClientPlainBytes)}，请拆成更小的内容后再保存。`);
+      }
+      let bytes: Uint8Array;
+      try {
+        bytes = new Uint8Array(await file.arrayBuffer());
+      } catch {
+        throw new Error(`无法读取文件：${file.name || '未命名文件'}。请确认文件仍在本机且未被占用。`);
+      }
+      await addPlainBytes({
+        bytes,
+        kind: file.type.startsWith('image/') ? 'image' : 'file',
+        name: file.name || 'clipboard.bin',
+        mime: file.type || 'application/octet-stream',
+        preview: file.type.startsWith('image/') ? file.name || '图片' : file.name || '文件'
+      });
+    }, '已上传');
+  }
+
+  async function addPlainBytes(input: { bytes: Uint8Array; kind: ClipEntry['kind']; name: string; mime: string; preview: string }) {
+    const group = requireGroup();
+    if (input.bytes.byteLength > maxClientPlainBytes) {
+      throw new Error(`单条内容不能超过 ${formatSize(maxClientPlainBytes)}，请拆成更小的内容后再保存。`);
+    }
+    const encrypted = await encryptBytes(group.vaultCryptoKey, input.bytes);
+    const uploaded = await uploadBlob(group, encrypted);
+    const now = Date.now();
+    const clip: ClipEntry = {
+      id: uploaded.clipId,
+      blobId: uploaded.clipId,
+      kind: input.kind,
+      name: input.name,
+      mime: input.mime,
+      preview: input.preview,
+      size: input.bytes.byteLength,
+      encryptedSize: encrypted.byteLength,
+      createdAt: now,
+      updatedAt: now,
+      expiresAt: now + retentionMs,
+      pinned: false
+    };
+    await persist({
+      ...index(),
+      updatedAt: now,
+      clips: [clip, ...index().clips]
+    }, group);
+  }
+
+  async function readClipboard() {
+    await run(async () => {
+      const nav = navigator.clipboard as Navigator['clipboard'] & {
+        read?: () => Promise<ClipboardItem[]>;
+      };
+      if (nav.read) {
+        const items = await nav.read();
+        for (const item of items) {
+          const imageType = item.types.find((type) => type.startsWith('image/'));
+          if (imageType) {
+            const blob = await item.getType(imageType);
+            await addFile(new File([blob], `clipboard-${Date.now()}.png`, { type: imageType }));
+            return;
+          }
+        }
+      }
+      const text = await navigator.clipboard.readText();
+      if (text.trim()) {
+        await addPlainBytes({
+          bytes: textEncoder.encode(text),
+          kind: 'text',
+          name: '文本',
+          mime: 'text/plain;charset=utf-8',
+          preview: text.slice(0, 160)
+        });
+      }
+    }, '已读取');
+  }
+
+  async function copyClip(clip: ClipEntry) {
+    await run(async () => {
+      const plain = await plainBytes(clip);
+      if (clip.kind === 'text') {
+        await navigator.clipboard.writeText(textDecoder.decode(plain));
+        return;
+      }
+      if (clip.kind === 'image' && 'ClipboardItem' in window && navigator.clipboard.write) {
+        const blob = new Blob([bytesToArrayBuffer(plain)], { type: clip.mime || 'image/png' });
+        await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
+        return;
+      }
+      downloadPlain(clip, plain);
+    }, clip.kind === 'file' ? '已下载' : '已复制');
+  }
+
+  async function downloadClip(clip: ClipEntry) {
+    await run(async () => {
+      downloadPlain(clip, await plainBytes(clip));
+    }, '已下载');
+  }
+
+  async function previewClip(clip: ClipEntry) {
+    if (clip.kind !== 'image') {
+      return;
+    }
+    await run(async () => {
+      const plain = await plainBytes(clip);
+      const url = URL.createObjectURL(new Blob([bytesToArrayBuffer(plain)], { type: clip.mime || 'image/png' }));
+      setPreviewUrls((current) => {
+        if (current[clip.id]) {
+          URL.revokeObjectURL(current[clip.id]);
+        }
+        return { ...current, [clip.id]: url };
+      });
+    }, '已解密预览');
+  }
+
+  async function plainBytes(clip: ClipEntry): Promise<Uint8Array> {
+    const group = requireGroup();
+    return decryptBytes(group.vaultCryptoKey, await downloadBlob(group, clip.blobId));
+  }
+
+  async function removeClip(clip: ClipEntry) {
+    await run(async () => {
+      const group = requireGroup();
+      await deleteBlob(group, clip.blobId);
+      const now = Date.now();
+      const next = {
+        ...index(),
+        updatedAt: now,
+        clips: index().clips.filter((item) => item.id !== clip.id),
+        deleted: [...index().deleted, { id: clip.id, deletedAt: now }]
+      };
+      await persist(next, group);
+      setPreviewUrls((current) => {
+        const copy = { ...current };
+        if (copy[clip.id]) {
+          URL.revokeObjectURL(copy[clip.id]);
+          delete copy[clip.id];
+        }
+        return copy;
+      });
+    }, '已删除');
+  }
+
+  async function togglePin(clip: ClipEntry) {
+    await run(async () => {
+      const now = Date.now();
+      const next = {
+        ...index(),
+        updatedAt: now,
+        clips: index().clips.map((item) =>
+          item.id === clip.id
+            ? {
+                ...item,
+                pinned: !item.pinned,
+                expiresAt: item.pinned ? now + retentionMs : null,
+                updatedAt: now
+              }
+            : item
+        )
+      };
+      await persist(next);
+    }, '已更新');
+  }
+
+  async function cleanupExpired(currentIndex: ClipIndex, group: ActiveGroup, hash: string) {
+    const now = Date.now();
+    const expired = currentIndex.clips.filter((clip) => isExpired(clip, now));
+    if (expired.length === 0) {
+      setIndex(currentIndex);
+      return;
+    }
+    await Promise.allSettled(expired.map((clip) => deleteBlob(group, clip.blobId)));
+    const next: ClipIndex = {
+      ...currentIndex,
+      updatedAt: now,
+      clips: currentIndex.clips.filter((clip) => !isExpired(clip, now)),
+      deleted: [...currentIndex.deleted, ...expired.map((clip) => ({ id: clip.id, deletedAt: now }))]
+    };
+    await persist(next, group, hash);
+  }
+
+  function handlePaste(event: ClipboardEvent) {
+    if (!unlocked() || isTyping()) {
+      return;
+    }
+    const files = [...(event.clipboardData?.files || [])];
+    if (files.length > 0) {
+      event.preventDefault();
+      files.forEach((file) => void addFile(file));
+      return;
+    }
+    const text = event.clipboardData?.getData('text/plain');
+    if (text?.trim()) {
+      event.preventDefault();
+      void addPlainBytes({
+        bytes: textEncoder.encode(text),
+        kind: 'text',
+        name: '文本',
+        mime: 'text/plain;charset=utf-8',
+        preview: text.slice(0, 160)
+      });
+    }
+  }
+
+  function handleDrop(event: DragEvent) {
+    event.preventDefault();
+    if (!unlocked()) {
+      return;
+    }
+    [...(event.dataTransfer?.files || [])].forEach((file) => void addFile(file));
+  }
+
+  function preventDefault(event: Event) {
+    event.preventDefault();
+  }
+
+  async function run(action: () => Promise<void>, ok: string) {
+    setBusy(true);
+    setError('');
+    setStatus('');
+    try {
+      await action();
+      setStatus(ok);
+    } catch (err) {
+      setError(displayError(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function requireGroup(): ActiveGroup {
+    const group = activeGroup();
+    if (!group) {
+      throw new Error('请先创建或导入一个分组');
+    }
+    return group;
+  }
+
+  function clearPreviewUrls() {
+    Object.values(previewUrls()).forEach(URL.revokeObjectURL);
+    setPreviewUrls({});
+  }
+
+  return (
+    <main class="app">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark"><Users size={18} /></div>
+          <div>
+            <h1>OpenList Clipboard</h1>
+            <span>{activeGroup() ? `${activeGroup()!.name} · ${activeClips().length} 条` : 'no group'}</span>
+          </div>
+        </div>
+        <div class="top-actions">
+          <Show when={groups().length > 0}>
+            <select class="group-select" value={activeGroup()?.id || ''} disabled={busy()} onChange={(event) => void switchGroup(event.currentTarget.value)}>
+              <option value="" disabled>选择分组</option>
+              <For each={groups()}>{(group) => <option value={group.id}>{group.name}</option>}</For>
+            </select>
+          </Show>
+          <Show when={unlocked()}>
+            <span class={`live-pill ${liveState()}`}>{liveStateLabel(liveState())}</span>
+            <button class="icon-button" title="刷新" disabled={busy()} onClick={() => void run(() => loadIndex(), '已刷新')}>
+              <RefreshCw size={18} />
+            </button>
+            <button class="icon-button" title="读取剪贴板" disabled={busy()} onClick={() => void readClipboard()}>
+              <ClipboardIcon size={18} />
+            </button>
+            <button class="icon-button" title="离开分组" disabled={busy()} onClick={leaveGroup}>
+              <LogOut size={18} />
+            </button>
+          </Show>
+        </div>
+      </header>
+
+      <Show when={!unlocked()}>
+        <section class="key-panel">
+          <div class="panel-title">
+            <KeyRound size={18} />
+            <h2>分组邀请码</h2>
+          </div>
+          <Show when={cryptoUnavailable}>
+            <p class="notice">{cryptoUnavailable}</p>
+          </Show>
+          <form class="group-form" onSubmit={createGroupAction}>
+            <input
+              value={groupName()}
+              onInput={(event) => setGroupName(event.currentTarget.value)}
+              placeholder="本机显示名"
+              autocomplete="off"
+            />
+            <button type="submit" disabled={busy() || !!cryptoUnavailable}>
+              <Plus size={17} />
+              创建组
+            </button>
+          </form>
+          <form class="group-form import-form" onSubmit={importGroupAction}>
+            <textarea
+              value={inviteInput()}
+              onInput={(event) => setInviteInput(event.currentTarget.value)}
+              placeholder="粘贴 olcgrp1 邀请码"
+              rows={4}
+              spellcheck={false}
+            />
+            <div class="composer-actions">
+              <button type="button" onClick={() => void startInviteScanner()} disabled={busy() || !!cryptoUnavailable}>
+                <Camera size={17} />
+                Scan
+              </button>
+              <button type="submit" disabled={busy() || !!cryptoUnavailable || inviteInput().trim().length === 0}>
+                <Upload size={17} />
+                导入组
+              </button>
+            </div>
+          </form>
+        </section>
+      </Show>
+
+      <Show when={unlocked()}>
+        <section class="composer">
+          <textarea
+            value={textDraft()}
+            onInput={(event) => setTextDraft(event.currentTarget.value)}
+            placeholder="Paste text"
+            rows={4}
+          />
+          <div class="composer-actions">
+            <label class="file-button" title="上传文件">
+              <Upload size={17} />
+              文件
+              <input type="file" multiple onChange={(event) => [...(event.currentTarget.files || [])].forEach((file) => void addFile(file))} />
+            </label>
+            <button onClick={() => void addText()} disabled={busy() || textDraft().trim().length === 0}>
+              <FileText size={17} />
+              保存
+            </button>
+          </div>
+        </section>
+
+        <section class="vault-strip">
+          <span class="mono">{activeGroup()?.id}</span>
+          <button class="icon-button" title="生成邀请二维码" onClick={() => void showInviteCodeQR()}>
+            <QrCode size={17} />
+          </button>
+          <button class="icon-button" title="复制邀请码" onClick={() => void navigator.clipboard.writeText(requireGroup().invite)}>
+            <Copy size={17} />
+          </button>
+          <button class="icon-button danger" title="从本机移除此分组" onClick={removeActiveGroup}>
+            <Trash2 size={17} />
+          </button>
+        </section>
+
+        <section class="clip-list">
+          <Show when={activeClips().length > 0} fallback={<div class="empty">No clips</div>}>
+            <For each={activeClips()}>
+              {(clip) => (
+                <article class="clip-card">
+                  <div class="clip-icon">
+                    <Show
+                      when={clip.kind === 'text'}
+                      fallback={<Show when={clip.kind === 'image'} fallback={<FileIcon size={19} />}><ImageIcon size={19} /></Show>}
+                    >
+                      <FileText size={19} />
+                    </Show>
+                  </div>
+                  <div class="clip-main">
+                    <div class="clip-head">
+                      <strong>{clip.kind === 'text' ? clip.preview || '文本' : clip.name}</strong>
+                      <span>{formatSize(clip.size)} · {formatTime(clip.createdAt)}</span>
+                    </div>
+                    <Show when={clip.kind === 'text'}>
+                      <p>{clip.preview}</p>
+                    </Show>
+                    <Show when={clip.kind === 'image' && previewUrls()[clip.id]}>
+                      <img class="preview" src={previewUrls()[clip.id]} alt={clip.name} />
+                    </Show>
+                  </div>
+                  <div class="clip-actions">
+                    <button class="icon-button" title="复制" disabled={busy()} onClick={() => void copyClip(clip)}>
+                      <Copy size={17} />
+                    </button>
+                    <Show when={clip.kind === 'image'}>
+                      <button class="icon-button" title="预览" disabled={busy()} onClick={() => void previewClip(clip)}>
+                        <Eye size={17} />
+                      </button>
+                    </Show>
+                    <button class="icon-button" title="下载" disabled={busy()} onClick={() => void downloadClip(clip)}>
+                      <Download size={17} />
+                    </button>
+                    <button class="icon-button" title={clip.pinned ? '取消置顶' : '置顶'} disabled={busy()} onClick={() => void togglePin(clip)}>
+                      <Show when={clip.pinned} fallback={<Pin size={17} />}><PinOff size={17} /></Show>
+                    </button>
+                    <button class="icon-button danger" title="删除" disabled={busy()} onClick={() => void removeClip(clip)}>
+                      <Trash2 size={17} />
+                    </button>
+                  </div>
+                </article>
+              )}
+            </For>
+          </Show>
+        </section>
+      </Show>
+
+      <Show when={showInviteQR()}>
+        <div class="modal-backdrop" onClick={() => setShowInviteQR(false)}>
+          <section class="modal-panel qr-panel" onClick={(event) => event.stopPropagation()}>
+            <div class="modal-head">
+              <h2>Group Invite QR</h2>
+              <button class="icon-button" title="Close" onClick={() => setShowInviteQR(false)}>
+                <X size={17} />
+              </button>
+            </div>
+            <p class="notice">邀请码包含此组的完整访问权限，只分享给可信设备。</p>
+            <Show when={inviteQR()}>
+              <img class="qr-image" src={inviteQR()} alt="Group invite QR" />
+            </Show>
+            <div class="qr-actions">
+              <button onClick={() => void navigator.clipboard.writeText(requireGroup().invite)}>
+                <Copy size={17} />
+                Copy
+              </button>
+            </div>
+          </section>
+        </div>
+      </Show>
+
+      <Show when={scannerOpen()}>
+        <div class="modal-backdrop" onClick={stopInviteScanner}>
+          <section class="modal-panel scanner-panel" onClick={(event) => event.stopPropagation()}>
+            <div class="modal-head">
+              <h2>Scan Invite</h2>
+              <button class="icon-button" title="Close" onClick={stopInviteScanner}>
+                <X size={17} />
+              </button>
+            </div>
+            <video class="scanner-video" ref={(el) => (scannerVideo = el)} muted playsinline />
+            <canvas ref={(el) => (scannerCanvas = el)} hidden />
+          </section>
+        </div>
+      </Show>
+
+      <Show when={status() || error()}>
+        <div class={error() ? 'toast error' : 'toast'}>{error() || status()}</div>
+      </Show>
+    </main>
+  );
+}
+
+function isExpired(clip: ClipEntry, now = Date.now()) {
+  return !clip.pinned && clip.expiresAt !== null && clip.expiresAt <= now;
+}
+
+function isTyping() {
+  const element = document.activeElement;
+  if (!element) {
+    return false;
+  }
+  return ['INPUT', 'TEXTAREA', 'SELECT'].includes(element.tagName) || (element as HTMLElement).isContentEditable;
+}
+
+function displayError(err: unknown) {
+  const message = err instanceof Error ? err.message : String(err);
+  if (err instanceof DOMException && err.name === 'OperationError') {
+    return '操作失败：浏览器加密、签名或文件读取没有返回具体原因。请确认邀请码匹配，并把过大的内容拆小后重试。';
+  }
+  if (/operation failed for an operation-specific reason/i.test(message)) {
+    return '操作失败：浏览器加密、签名或文件读取没有返回具体原因。请确认邀请码匹配，并把过大的内容拆小后重试。';
+  }
+  return message;
+}
+
+function downloadPlain(clip: ClipEntry, bytes: Uint8Array) {
+  const url = URL.createObjectURL(new Blob([bytesToArrayBuffer(bytes)], { type: clip.mime || 'application/octet-stream' }));
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = clip.name || `${clip.id}.bin`;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
+function nextAnimationFrame(): Promise<void> {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+}
+
+function liveStateLabel(state: LiveState) {
+  if (state === 'live') return '实时';
+  if (state === 'connecting') return '连接中';
+  return '离线';
+}
+
+function formatSize(size: number) {
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function formatTime(time: number) {
+  return new Intl.DateTimeFormat('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit'
+  }).format(new Date(time));
+}

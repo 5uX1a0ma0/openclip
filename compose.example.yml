@@ -1,0 +1,22 @@
+services:
+  openlist-clipboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: openlist-clipboard:local
+    container_name: openlist-clipboard
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      CLIPBOARD_ADDR: ":8080"
+      CLIPBOARD_ALLOWED_ORIGIN: "${CLIPBOARD_ALLOWED_ORIGIN:-http://localhost:8080}"
+      CLIPBOARD_MAX_BLOB_BYTES: "${CLIPBOARD_MAX_BLOB_BYTES:-52428800}"
+      OPENLIST_BASE_URL: "${OPENLIST_BASE_URL:-http://host.docker.internal:5244}"
+      OPENLIST_USERNAME: "${OPENLIST_USERNAME:-clipboard}"
+      OPENLIST_PASSWORD: "${OPENLIST_PASSWORD:-change-this-openlist-password}"
+      OPENLIST_OTP_CODE: "${OPENLIST_OTP_CODE:-}"
+      OPENLIST_ROOT: "${OPENLIST_ROOT:-/clipboard}"
+      OPENLIST_CLIENT_ID: "${OPENLIST_CLIENT_ID:-openlist-clipboard-gateway}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
