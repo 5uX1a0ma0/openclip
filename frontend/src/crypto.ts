@@ -15,7 +15,6 @@ const p256G: Exclude<P256Point, null> = {
 };
 
 export type SigningIdentity = {
-  privateKeyJwk: JsonWebKey;
   publicKeyJwk: JsonWebKey;
   signingKey: CryptoKey;
 };
@@ -93,19 +92,19 @@ export async function deriveSigningIdentity(vaultKey: string): Promise<SigningId
     ext: true,
     key_ops: ['verify']
   };
-  const privateKeyJwk: JsonWebKey = {
+  const signingJwk: JsonWebKey = {
     ...publicKeyJwk,
     d,
     key_ops: ['sign']
   };
   const signingKey = await requireSubtleCrypto().importKey(
     'jwk',
-    privateKeyJwk,
+    signingJwk,
     { name: 'ECDSA', namedCurve: 'P-256' },
     false,
     ['sign']
   );
-  return { privateKeyJwk, publicKeyJwk, signingKey };
+  return { publicKeyJwk, signingKey };
 }
 
 export async function encryptBytes(key: CryptoKey, plaintext: Uint8Array): Promise<Uint8Array> {

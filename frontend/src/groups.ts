@@ -9,14 +9,11 @@ import {
 import type { ActiveGroup, SavedGroup } from './types';
 
 const clipboardKeyPrefix = 'olckey1.';
-const legacyInvitePrefix = 'olcgrp1.';
 const groupsStorageName = 'openlist.clipboard.groups.v1';
 const activeGroupStorageName = 'openlist.clipboard.activeGroup.v1';
-const oldVaultKeyStorageName = 'openlist.clipboard.vaultKey';
 const keyPattern = /^[A-Za-z0-9_-]{43}$/;
 
 export function loadSavedGroups(): SavedGroup[] {
-  localStorage.removeItem(oldVaultKeyStorageName);
   const raw = localStorage.getItem(groupsStorageName);
   if (!raw) {
     return [];
@@ -60,18 +57,7 @@ export async function savedGroupFromInvite(inviteText: string, name = ''): Promi
 
 export async function activateGroup(group: SavedGroup): Promise<ActiveGroup> {
   const vaultCryptoKey = await importVaultKey(group.vaultKey);
-  let signingKey: CryptoKey;
-  if (group.privateKeyJwk) {
-    signingKey = await crypto.subtle.importKey(
-      'jwk',
-      group.privateKeyJwk,
-      { name: 'ECDSA', namedCurve: 'P-256' },
-      false,
-      ['sign']
-    );
-  } else {
-    signingKey = (await deriveSigningIdentity(group.vaultKey)).signingKey;
-  }
+  const signingKey = (await deriveSigningIdentity(group.vaultKey)).signingKey;
   return { ...group, vaultCryptoKey, signingKey };
 }
 
@@ -99,7 +85,7 @@ export function removeGroup(groups: SavedGroup[], groupId: string): SavedGroup[]
 
 export function isInviteText(value: string): boolean {
   const trimmed = value.trim();
-  return trimmed.startsWith(clipboardKeyPrefix) || trimmed.startsWith(legacyInvitePrefix) || keyPattern.test(trimmed);
+  return trimmed.startsWith(clipboardKeyPrefix) || keyPattern.test(trimmed);
 }
 
 export function encodeClipboardKey(vaultKey: string): string {
@@ -113,9 +99,6 @@ export function decodeClipboardKey(value: string): string {
   }
   if (keyPattern.test(trimmed)) {
     return validateVaultKey(trimmed);
-  }
-  if (trimmed.startsWith(legacyInvitePrefix)) {
-    return decodeLegacyVaultKey(trimmed);
   }
   throw new Error('剪贴板密钥格式不正确');
 }
@@ -131,7 +114,6 @@ async function savedGroupFromVaultKey(vaultKey: string, name: string): Promise<S
     vaultKey,
     keyHash,
     publicKeyJwk: identity.publicKeyJwk,
-    privateKeyJwk: identity.privateKeyJwk,
     invite: encodeClipboardKey(vaultKey),
     createdAt: now,
     updatedAt: now
@@ -146,19 +128,6 @@ function validateVaultKey(value: string): string {
     throw new Error('剪贴板密钥长度不正确');
   }
   return value;
-}
-
-function decodeLegacyVaultKey(value: string): string {
-  try {
-    const raw = new TextDecoder().decode(base64UrlToBytes(value.slice(legacyInvitePrefix.length)));
-    const parsed = JSON.parse(raw) as { vaultKey?: string };
-    if (parsed.vaultKey) {
-      return validateVaultKey(parsed.vaultKey);
-    }
-  } catch {
-    // Fall through to a consistent user-facing error.
-  }
-  throw new Error('旧版分享内容无法解析，请改用剪贴板密钥');
 }
 
 function cleanGroupName(name: string): string {

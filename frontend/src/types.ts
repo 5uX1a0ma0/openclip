@@ -48,7 +48,6 @@ export type SavedGroup = {
   vaultKey: string;
   keyHash: string;
   publicKeyJwk: JsonWebKey;
-  privateKeyJwk?: JsonWebKey;
   invite: string;
   createdAt: number;
   updatedAt: number;

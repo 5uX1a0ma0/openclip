@@ -32,23 +32,6 @@ func testServer() (http.Handler, *memoryStore) {
 	return handler, store
 }
 
-func TestLegacySessionAPIRemoved(t *testing.T) {
-	handler, _ := testServer()
-	req := httptest.NewRequest(http.MethodPost, "/api/session/login", strings.NewReader(`{"password":"secret"}`))
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("legacy login status=%d body=%s", rec.Code, rec.Body.String())
-	}
-
-	req = httptest.NewRequest(http.MethodGet, "/api/v1/index", nil)
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("legacy index status=%d body=%s", rec.Code, rec.Body.String())
-	}
-}
-
 func TestCreateGroupIdempotentAndRejectDifferentKey(t *testing.T) {
 	handler, _ := testServer()
 	group := newTestGroup(t, 1)

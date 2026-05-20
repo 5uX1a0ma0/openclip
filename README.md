@@ -84,7 +84,6 @@ CLIPBOARD_CREATE_PASSWORD=change-this-create-password
 ## 存储布局
 
 - 新 V1 路径：`/clipboard/v1/groups/{groupId}/group.json`、`index.enc`、`blobs/YYYY-MM/{clipId}.bin`。
-- 旧版 `/clipboard/v1/users/default` 不再读写，也不会自动删除；需要管理员手动清理。
 
 ## 安全边界
 
