@@ -25,6 +25,7 @@ import {
   deleteBlob,
   downloadBlob,
   fetchIndex,
+  joinRemoteGroup,
   openIndexEvents,
   saveIndex,
   uploadBlob
@@ -86,6 +87,7 @@ export default function App() {
   const [groups, setGroups] = createSignal<SavedGroup[]>([]);
   const [activeGroup, setActiveGroup] = createSignal<ActiveGroup | null>(null);
   const [groupName, setGroupName] = createSignal('');
+  const [createPassword, setCreatePassword] = createSignal('');
   const [inviteInput, setInviteInput] = createSignal('');
   const [index, setIndex] = createSignal<ClipIndex>(emptyIndex());
   const [baseHash, setBaseHash] = createSignal('');
@@ -129,7 +131,7 @@ export default function App() {
     setGroups(saved);
     const initial = saved.find((group) => group.id === activeGroupId()) || saved[0];
     if (initial && !cryptoUnavailable) {
-      await run(() => activateExistingGroup(initial), '已打开分组');
+      await run(() => activateExistingGroup(initial), '已打开剪贴板');
     }
   });
 
@@ -158,27 +160,30 @@ export default function App() {
     event.preventDefault();
     await run(async () => {
       const saved = await createSavedGroup(groupName());
-      await createRemoteGroup(saved.id, saved.publicKeyJwk);
-      const next = upsertGroup(groups(), saved);
+      const remote = await createRemoteGroup(saved.id, saved.name, saved.keyHash, saved.publicKeyJwk, createPassword());
+      const opened = { ...saved, name: remote.name, updatedAt: Date.now() };
+      const next = upsertGroup(groups(), opened);
       setGroups(next);
       saveSavedGroups(next);
       setGroupName('');
-      await activateExistingGroup(saved);
-    }, '分组已创建');
+      setCreatePassword('');
+      await activateExistingGroup(opened);
+    }, '剪贴板已创建');
   }
 
   async function importGroupAction(event?: Event) {
     event?.preventDefault();
     await run(async () => {
       const saved = await savedGroupFromInvite(inviteInput(), groupName());
-      await createRemoteGroup(saved.id, saved.publicKeyJwk);
-      const next = upsertGroup(groups(), saved);
+      const remote = await joinRemoteGroup(saved.id, saved.keyHash, saved.publicKeyJwk);
+      const joined = { ...saved, name: remote.name, updatedAt: Date.now() };
+      const next = upsertGroup(groups(), joined);
       setGroups(next);
       saveSavedGroups(next);
       setGroupName('');
       setInviteInput('');
-      await activateExistingGroup(saved);
-    }, '分组已导入');
+      await activateExistingGroup(joined);
+    }, '已加入剪贴板');
   }
 
   async function activateExistingGroup(saved: SavedGroup) {
@@ -216,7 +221,7 @@ export default function App() {
     setGroups(next);
     saveSavedGroups(next);
     leaveGroup();
-    setStatus('已从本机移除此分组');
+    setStatus('已从本机移除此剪贴板');
   }
 
   async function switchGroup(groupID: string) {
@@ -224,7 +229,7 @@ export default function App() {
     if (!saved) {
       return;
     }
-    await run(() => activateExistingGroup(saved), '已切换分组');
+    await run(() => activateExistingGroup(saved), '已切换剪贴板');
   }
 
   async function showInviteCodeQR() {
@@ -278,7 +283,7 @@ export default function App() {
         const decoded = decodeQRCodeFromCanvas(scannerCanvas);
         if (decoded) {
           if (!isInviteText(decoded)) {
-            setError('二维码不是有效的分组邀请码');
+            setError('二维码不是有效的剪贴板密钥');
           } else {
             scannerDone = true;
             stopInviteScanner();
@@ -406,7 +411,7 @@ export default function App() {
 
   async function persist(next: ClipIndex, group = activeGroup(), hash = baseHash()) {
     if (!group) {
-      throw new Error('请先打开一个分组');
+      throw new Error('请先打开一个剪贴板');
     }
     const encrypted = await encryptIndex(group.vaultCryptoKey, next);
     try {
@@ -950,7 +955,7 @@ export default function App() {
   function requireGroup(): ActiveGroup {
     const group = activeGroup();
     if (!group) {
-      throw new Error('请先创建或导入一个分组');
+      throw new Error('请先创建或加入一个剪贴板');
     }
     return group;
   }
@@ -967,13 +972,13 @@ export default function App() {
           <div class="brand-mark"><Users size={18} /></div>
           <div>
             <h1>OpenList Clipboard</h1>
-            <span>{activeGroup() ? `${activeGroup()!.name} · ${activeClips().length} 条` : 'no group'}</span>
+            <span>{activeGroup() ? `${activeGroup()!.name} · ${activeClips().length} 条` : '未打开剪贴板'}</span>
           </div>
         </div>
         <div class="top-actions">
           <Show when={groups().length > 0}>
             <select class="group-select" value={activeGroup()?.id || ''} disabled={busy()} onChange={(event) => void switchGroup(event.currentTarget.value)}>
-              <option value="" disabled>选择分组</option>
+              <option value="" disabled>选择剪贴板</option>
               <For each={groups()}>{(group) => <option value={group.id}>{group.name}</option>}</For>
             </select>
           </Show>
@@ -994,7 +999,7 @@ export default function App() {
             <button class="icon-button" title="读取剪贴板" disabled={busy()} onClick={() => void readClipboard()}>
               <ClipboardIcon size={18} />
             </button>
-            <button class="icon-button" title="离开分组" disabled={busy()} onClick={leaveGroup}>
+            <button class="icon-button" title="离开剪贴板" disabled={busy()} onClick={leaveGroup}>
               <LogOut size={18} />
             </button>
           </Show>
@@ -1005,28 +1010,37 @@ export default function App() {
         <section class="key-panel">
           <div class="panel-title">
             <KeyRound size={18} />
-            <h2>分组邀请码</h2>
+            <h2>剪贴板</h2>
           </div>
           <Show when={cryptoUnavailable}>
             <p class="notice">{cryptoUnavailable}</p>
           </Show>
           <form class="group-form" onSubmit={createGroupAction}>
+            <div class="form-title">创建剪贴板</div>
             <input
               value={groupName()}
               onInput={(event) => setGroupName(event.currentTarget.value)}
-              placeholder="本机显示名"
+              placeholder="剪贴板名称"
               autocomplete="off"
             />
-            <button type="submit" disabled={busy() || !!cryptoUnavailable}>
+            <input
+              type="password"
+              value={createPassword()}
+              onInput={(event) => setCreatePassword(event.currentTarget.value)}
+              placeholder="创建密码"
+              autocomplete="current-password"
+            />
+            <button type="submit" disabled={busy() || !!cryptoUnavailable || groupName().trim().length === 0}>
               <Plus size={17} />
-              创建组
+              创建剪贴板
             </button>
           </form>
           <form class="group-form import-form" onSubmit={importGroupAction}>
+            <div class="form-title">加入已有剪贴板</div>
             <textarea
               value={inviteInput()}
               onInput={(event) => setInviteInput(event.currentTarget.value)}
-              placeholder="粘贴 olcgrp1 邀请码"
+              placeholder="粘贴 olckey1 剪贴板密钥"
               rows={4}
               spellcheck={false}
             />
@@ -1037,7 +1051,7 @@ export default function App() {
               </button>
               <button type="submit" disabled={busy() || !!cryptoUnavailable || inviteInput().trim().length === 0}>
                 <Upload size={17} />
-                导入组
+                加入剪贴板
               </button>
             </div>
           </form>
@@ -1066,14 +1080,14 @@ export default function App() {
         </section>
 
         <section class="vault-strip">
-          <span class="mono">{activeGroup()?.id}</span>
-          <button class="icon-button" title="生成邀请二维码" onClick={() => void showInviteCodeQR()}>
+          <span class="mono">{activeGroup()?.invite}</span>
+          <button class="icon-button" title="生成剪贴板密钥二维码" onClick={() => void showInviteCodeQR()}>
             <QrCode size={17} />
           </button>
-          <button class="icon-button" title="复制邀请码" onClick={() => void navigator.clipboard.writeText(requireGroup().invite)}>
+          <button class="icon-button" title="复制剪贴板密钥" onClick={() => void navigator.clipboard.writeText(requireGroup().invite)}>
             <Copy size={17} />
           </button>
-          <button class="icon-button danger" title="从本机移除此分组" onClick={removeActiveGroup}>
+          <button class="icon-button danger" title="从本机移除此剪贴板" onClick={removeActiveGroup}>
             <Trash2 size={17} />
           </button>
         </section>
@@ -1133,19 +1147,19 @@ export default function App() {
         <div class="modal-backdrop" onClick={() => setShowInviteQR(false)}>
           <section class="modal-panel qr-panel" onClick={(event) => event.stopPropagation()}>
             <div class="modal-head">
-              <h2>Group Invite QR</h2>
+              <h2>剪贴板密钥二维码</h2>
               <button class="icon-button" title="Close" onClick={() => setShowInviteQR(false)}>
                 <X size={17} />
               </button>
             </div>
-            <p class="notice">邀请码包含此组的完整访问权限，只分享给可信设备。</p>
+            <p class="notice">剪贴板密钥包含完整访问权限，只分享给可信设备。</p>
             <Show when={inviteQR()}>
-              <img class="qr-image" src={inviteQR()} alt="Group invite QR" />
+              <img class="qr-image" src={inviteQR()} alt="Clipboard key QR" />
             </Show>
             <div class="qr-actions">
               <button onClick={() => void navigator.clipboard.writeText(requireGroup().invite)}>
                 <Copy size={17} />
-                Copy
+                复制密钥
               </button>
             </div>
           </section>
@@ -1156,7 +1170,7 @@ export default function App() {
         <div class="modal-backdrop" onClick={stopInviteScanner}>
           <section class="modal-panel scanner-panel" onClick={(event) => event.stopPropagation()}>
             <div class="modal-head">
-              <h2>Scan Invite</h2>
+              <h2>扫描剪贴板密钥</h2>
               <button class="icon-button" title="Close" onClick={stopInviteScanner}>
                 <X size={17} />
               </button>
@@ -1295,10 +1309,10 @@ function clipboardSyncError(err: unknown) {
 function displayError(err: unknown) {
   const message = err instanceof Error ? err.message : String(err);
   if (err instanceof DOMException && err.name === 'OperationError') {
-    return '操作失败：浏览器加密、签名或文件读取没有返回具体原因。请确认邀请码匹配，并把过大的内容拆小后重试。';
+    return '操作失败：浏览器加密、签名或文件读取没有返回具体原因。请确认剪贴板密钥匹配，并把过大的内容拆小后重试。';
   }
   if (/operation failed for an operation-specific reason/i.test(message)) {
-    return '操作失败：浏览器加密、签名或文件读取没有返回具体原因。请确认邀请码匹配，并把过大的内容拆小后重试。';
+    return '操作失败：浏览器加密、签名或文件读取没有返回具体原因。请确认剪贴板密钥匹配，并把过大的内容拆小后重试。';
   }
   return message;
 }

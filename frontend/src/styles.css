@@ -133,7 +133,19 @@ button:disabled {
 
 .group-form {
   align-items: stretch;
+  flex-wrap: wrap;
   margin-top: 12px;
+}
+
+.form-title {
+  width: 100%;
+  color: #43524e;
+  font-size: 13px;
+  font-weight: 750;
+}
+
+.import-form .form-title {
+  grid-column: 1 / -1;
 }
 
 .group-form input {

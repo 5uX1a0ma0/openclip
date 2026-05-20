@@ -2,6 +2,23 @@ import type { ClipIndex } from './types';
 
 const magic = new Uint8Array([0x4f, 0x4c, 0x43, 0x31]);
 const groupIdDomain = 'openlist-clipboard-group-v1';
+const keyHashDomain = 'openlist-clipboard-key-check-v1';
+const signingKeyDomain = 'openlist-clipboard-signing-v1';
+
+type P256Point = { x: bigint; y: bigint } | null;
+
+const p256P = BigInt('0xffffffff00000001000000000000000000000000ffffffffffffffffffffffff');
+const p256N = BigInt('0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551');
+const p256G: Exclude<P256Point, null> = {
+  x: BigInt('0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296'),
+  y: BigInt('0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5')
+};
+
+export type SigningIdentity = {
+  privateKeyJwk: JsonWebKey;
+  publicKeyJwk: JsonWebKey;
+  signingKey: CryptoKey;
+};
 
 export function emptyIndex(): ClipIndex {
   return {
@@ -50,6 +67,47 @@ export async function deriveGroupId(vaultKey: string): Promise<string> {
   return bytesToBase64Url(new Uint8Array(await requireSubtleCrypto().digest('SHA-256', bytesToArrayBuffer(input))));
 }
 
+export async function deriveKeyHash(vaultKey: string): Promise<string> {
+  const input = domainSeparatedBytes(keyHashDomain, vaultKeyBytes(vaultKey));
+  return bytesToBase64Url(new Uint8Array(await requireSubtleCrypto().digest('SHA-256', bytesToArrayBuffer(input))));
+}
+
+export async function deriveSigningIdentity(vaultKey: string): Promise<SigningIdentity> {
+  const seed = new Uint8Array(
+    await requireSubtleCrypto().digest('SHA-256', bytesToArrayBuffer(domainSeparatedBytes(signingKeyDomain, vaultKeyBytes(vaultKey))))
+  );
+  const scalar = (bytesToBigInt(seed) % (p256N - 1n)) + 1n;
+  const publicPoint = scalarBaseMult(scalar);
+  if (!publicPoint) {
+    throw new Error('无法从剪贴板密钥派生签名身份');
+  }
+
+  const d = bytesToBase64Url(bigIntToBytes(scalar));
+  const x = bytesToBase64Url(bigIntToBytes(publicPoint.x));
+  const y = bytesToBase64Url(bigIntToBytes(publicPoint.y));
+  const publicKeyJwk: JsonWebKey = {
+    kty: 'EC',
+    crv: 'P-256',
+    x,
+    y,
+    ext: true,
+    key_ops: ['verify']
+  };
+  const privateKeyJwk: JsonWebKey = {
+    ...publicKeyJwk,
+    d,
+    key_ops: ['sign']
+  };
+  const signingKey = await requireSubtleCrypto().importKey(
+    'jwk',
+    privateKeyJwk,
+    { name: 'ECDSA', namedCurve: 'P-256' },
+    false,
+    ['sign']
+  );
+  return { privateKeyJwk, publicKeyJwk, signingKey };
+}
+
 export async function encryptBytes(key: CryptoKey, plaintext: Uint8Array): Promise<Uint8Array> {
   const crypto = requireWebCrypto();
   const nonce = new Uint8Array(12);
@@ -93,7 +151,7 @@ export async function decryptBytes(key: CryptoKey, envelope: Uint8Array): Promis
       )
     );
   } catch (err) {
-    throw new Error(`解密失败：Vault Key 与当前数据不匹配，或远端数据已损坏。${errorDetail(err)}`);
+    throw new Error(`解密失败：剪贴板密钥与当前数据不匹配，或远端数据已损坏。${errorDetail(err)}`);
   }
 }
 
@@ -190,6 +248,93 @@ function requireSubtleCrypto(): SubtleCrypto {
     throw new Error(reason);
   }
   return globalThis.crypto.subtle;
+}
+
+function domainSeparatedBytes(domainText: string, bytes: Uint8Array): Uint8Array {
+  const domain = new TextEncoder().encode(domainText);
+  const input = new Uint8Array(domain.byteLength + bytes.byteLength);
+  input.set(domain, 0);
+  input.set(bytes, domain.byteLength);
+  return input;
+}
+
+function mod(value: bigint, divisor = p256P): bigint {
+  const result = value % divisor;
+  return result >= 0n ? result : result + divisor;
+}
+
+function modInv(value: bigint, divisor = p256P): bigint {
+  let low = mod(value, divisor);
+  let high = divisor;
+  let lm = 1n;
+  let hm = 0n;
+  while (low > 1n) {
+    const ratio = high / low;
+    const next = high - low * ratio;
+    const nextM = hm - lm * ratio;
+    high = low;
+    hm = lm;
+    low = next;
+    lm = nextM;
+  }
+  return mod(lm, divisor);
+}
+
+function pointAdd(left: P256Point, right: P256Point): P256Point {
+  if (!left) return right;
+  if (!right) return left;
+  if (left.x === right.x) {
+    if (mod(left.y + right.y) === 0n) {
+      return null;
+    }
+    return pointDouble(left);
+  }
+  const slope = mod((right.y - left.y) * modInv(right.x - left.x));
+  const x = mod(slope * slope - left.x - right.x);
+  const y = mod(slope * (left.x - x) - left.y);
+  return { x, y };
+}
+
+function pointDouble(point: Exclude<P256Point, null>): P256Point {
+  if (point.y === 0n) {
+    return null;
+  }
+  const slope = mod((3n * point.x * point.x - 3n) * modInv(2n * point.y));
+  const x = mod(slope * slope - 2n * point.x);
+  const y = mod(slope * (point.x - x) - point.y);
+  return { x, y };
+}
+
+function scalarBaseMult(scalar: bigint): P256Point {
+  let n = scalar;
+  let result: P256Point = null;
+  let addend: P256Point = p256G;
+  while (n > 0n) {
+    if (n & 1n) {
+      result = pointAdd(result, addend);
+    }
+    addend = addend ? pointDouble(addend) : null;
+    n >>= 1n;
+  }
+  return result;
+}
+
+function bytesToBigInt(bytes: Uint8Array): bigint {
+  let value = 0n;
+  for (const byte of bytes) {
+    value = (value << 8n) + BigInt(byte);
+  }
+  return value;
+}
+
+function bigIntToBytes(value: bigint): Uint8Array {
+  const out = new Uint8Array(32);
+  let current = value;
+  for (let i = out.length - 1; i >= 0; i -= 1) {
+    out[i] = Number(current & 0xffn);
+    current >>= 8n;
+  }
+  return out;
 }
 
 function errorDetail(err: unknown) {

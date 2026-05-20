@@ -19,14 +19,16 @@ import (
 )
 
 type testGroup struct {
-	id  string
-	key *ecdsa.PrivateKey
-	jwk publicJWK
+	id      string
+	name    string
+	keyHash string
+	key     *ecdsa.PrivateKey
+	jwk     publicJWK
 }
 
 func testServer() (http.Handler, *memoryStore) {
 	store := newMemoryStore()
-	handler := New(Config{MaxBlobBytes: 1024}, store)
+	handler := New(Config{MaxBlobBytes: 1024, CreatePassword: "create-secret"}, store)
 	return handler, store
 }
 
@@ -56,6 +58,30 @@ func TestCreateGroupIdempotentAndRejectDifferentKey(t *testing.T) {
 	other := newTestGroup(t, 2)
 	other.id = group.id
 	createGroup(t, handler, other, http.StatusConflict)
+}
+
+func TestCreatePasswordAndJoinKeyHash(t *testing.T) {
+	handler, _ := testServer()
+	group := newTestGroup(t, 1)
+
+	reqBody, _ := json.Marshal(map[string]any{
+		"groupId":        group.id,
+		"name":           group.name,
+		"keyHash":        group.keyHash,
+		"publicKeyJwk":   group.jwk,
+		"createPassword": "wrong",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/groups", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong create password status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	createGroup(t, handler, group, http.StatusCreated)
+	joinGroup(t, handler, group, group.keyHash, http.StatusOK)
+	joinGroup(t, handler, group, strings.Repeat("A", 43), http.StatusUnauthorized)
 }
 
 func TestSignedIndexConflictAndGroupIsolation(t *testing.T) {
@@ -196,8 +222,10 @@ func newTestGroup(t *testing.T, seed byte) testGroup {
 	}
 	groupIDRaw := bytes.Repeat([]byte{seed}, 32)
 	return testGroup{
-		id:  base64.RawURLEncoding.EncodeToString(groupIDRaw),
-		key: key,
+		id:      base64.RawURLEncoding.EncodeToString(groupIDRaw),
+		name:    fmt.Sprintf("Clipboard %d", seed),
+		keyHash: base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{seed + 10}, 32)),
+		key:     key,
 		jwk: publicJWK{
 			Kty: "EC",
 			Crv: "P-256",
@@ -210,8 +238,11 @@ func newTestGroup(t *testing.T, seed byte) testGroup {
 func createGroup(t *testing.T, handler http.Handler, group testGroup, wantStatus int) {
 	t.Helper()
 	reqBody, _ := json.Marshal(map[string]any{
-		"groupId":      group.id,
-		"publicKeyJwk": group.jwk,
+		"groupId":        group.id,
+		"name":           group.name,
+		"keyHash":        group.keyHash,
+		"publicKeyJwk":   group.jwk,
+		"createPassword": "create-secret",
 	})
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/groups", bytes.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
@@ -219,6 +250,24 @@ func createGroup(t *testing.T, handler http.Handler, group testGroup, wantStatus
 	handler.ServeHTTP(rec, req)
 	if rec.Code != wantStatus {
 		t.Fatalf("create group status=%d want=%d body=%s", rec.Code, wantStatus, rec.Body.String())
+	}
+}
+
+func joinGroup(t *testing.T, handler http.Handler, group testGroup, keyHash string, wantStatus int) {
+	t.Helper()
+	reqBody, _ := json.Marshal(map[string]any{
+		"keyHash":      keyHash,
+		"publicKeyJwk": group.jwk,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/groups/"+group.id+"/join", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != wantStatus {
+		t.Fatalf("join group status=%d want=%d body=%s", rec.Code, wantStatus, rec.Body.String())
+	}
+	if wantStatus == http.StatusOK && !strings.Contains(rec.Body.String(), group.name) {
+		t.Fatalf("join response missing name: %s", rec.Body.String())
 	}
 }
 
@@ -252,7 +301,11 @@ func signedRequest(t *testing.T, method string, path string, body []byte, group 
 func signExistingRequest(t *testing.T, req *http.Request, body []byte, group testGroup, nonce string) {
 	t.Helper()
 	if nonce == "" {
-		nonce = "nonce-" + base64.RawURLEncoding.EncodeToString([]byte(time.Now().Format(time.RFC3339Nano)))
+		raw := make([]byte, 18)
+		if _, err := rand.Read(raw); err != nil {
+			t.Fatal(err)
+		}
+		nonce = "nonce-" + base64.RawURLEncoding.EncodeToString(raw)
 	}
 	timestamp := fmtTimestamp(time.Now())
 	bodyHash := sha256.Sum256(body)

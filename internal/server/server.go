@@ -6,6 +6,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -27,13 +28,15 @@ import (
 var (
 	clipIDPattern  = regexp.MustCompile(`^[0-9]{6}-[A-Za-z0-9_-]{22}$`)
 	groupIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`)
+	keyHashPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`)
 	noncePattern   = regexp.MustCompile(`^[A-Za-z0-9_-]{16,128}$`)
 )
 
 type Config struct {
-	AllowedOrigin string
-	MaxBlobBytes  int64
-	StaticDir     string
+	AllowedOrigin  string
+	CreatePassword string
+	MaxBlobBytes   int64
+	StaticDir      string
 }
 
 type API struct {
@@ -62,6 +65,7 @@ func New(cfg Config, store storage.Store) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", api.health)
 	mux.HandleFunc("POST /api/v1/groups", api.createGroup)
+	mux.HandleFunc("POST /api/v1/groups/{groupID}/join", api.joinGroup)
 	mux.HandleFunc("GET /api/v1/groups/{groupID}/index", api.withGroupAuth(api.getIndex))
 	mux.HandleFunc("PUT /api/v1/groups/{groupID}/index", api.withGroupAuth(api.putIndex))
 	mux.HandleFunc("GET /api/v1/groups/{groupID}/events", api.withGroupAuth(api.indexEvents))
@@ -79,15 +83,31 @@ func (a *API) health(w http.ResponseWriter, _ *http.Request) {
 
 func (a *API) createGroup(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		GroupID      string          `json:"groupId"`
-		PublicKeyJWK json.RawMessage `json:"publicKeyJwk"`
+		GroupID        string          `json:"groupId"`
+		Name           string          `json:"name"`
+		KeyHash        string          `json:"keyHash"`
+		PublicKeyJWK   json.RawMessage `json:"publicKeyJwk"`
+		CreatePassword string          `json:"createPassword"`
 	}
 	if err := decodeJSON(r, &req, 16*1024); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
+	if !a.createPasswordAllowed(req.CreatePassword) {
+		writeError(w, http.StatusUnauthorized, "create password failed")
+		return
+	}
 	if !groupIDPattern.MatchString(req.GroupID) {
 		writeError(w, http.StatusBadRequest, "invalid group id")
+		return
+	}
+	if !keyHashPattern.MatchString(req.KeyHash) {
+		writeError(w, http.StatusBadRequest, "invalid key hash")
+		return
+	}
+	name := cleanGroupName(req.Name)
+	if name == "" {
+		writeError(w, http.StatusBadRequest, "clipboard name is required")
 		return
 	}
 	publicKeyJWK, _, err := normalizePublicKeyJWK(req.PublicKeyJWK)
@@ -98,11 +118,11 @@ func (a *API) createGroup(w http.ResponseWriter, r *http.Request) {
 
 	existing, err := a.store.ReadGroup(r.Context(), req.GroupID)
 	if err == nil {
-		if !bytes.Equal(existing.PublicKeyJWK, publicKeyJWK) {
+		if !bytes.Equal(existing.PublicKeyJWK, publicKeyJWK) || existing.KeyHash != req.KeyHash {
 			writeError(w, http.StatusConflict, "group already exists with a different key")
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "groupId": req.GroupID})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "groupId": req.GroupID, "name": existing.Name})
 		return
 	}
 	if !errors.Is(err, storage.ErrNotFound) {
@@ -110,17 +130,67 @@ func (a *API) createGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	now := time.Now().UnixMilli()
 	group := storage.Group{
 		Version:      1,
 		GroupID:      req.GroupID,
+		Name:         name,
+		KeyHash:      req.KeyHash,
 		PublicKeyJWK: publicKeyJWK,
-		CreatedAt:    time.Now().UnixMilli(),
+		CreatedAt:    now,
+		UpdatedAt:    now,
 	}
 	if err := a.store.WriteGroup(r.Context(), group); err != nil {
 		writeError(w, http.StatusBadGateway, "openlist write failed")
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"ok": true, "groupId": req.GroupID})
+	writeJSON(w, http.StatusCreated, map[string]any{"ok": true, "groupId": req.GroupID, "name": name})
+}
+
+func (a *API) joinGroup(w http.ResponseWriter, r *http.Request) {
+	groupID := r.PathValue("groupID")
+	if !groupIDPattern.MatchString(groupID) {
+		writeError(w, http.StatusBadRequest, "invalid group id")
+		return
+	}
+	var req struct {
+		KeyHash      string          `json:"keyHash"`
+		PublicKeyJWK json.RawMessage `json:"publicKeyJwk"`
+	}
+	if err := decodeJSON(r, &req, 1024); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	if !keyHashPattern.MatchString(req.KeyHash) {
+		writeError(w, http.StatusBadRequest, "invalid key hash")
+		return
+	}
+	publicKeyJWK, _, err := normalizePublicKeyJWK(req.PublicKeyJWK)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid public key")
+		return
+	}
+	group, err := a.store.ReadGroup(r.Context(), groupID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "clipboard not found")
+			return
+		}
+		writeError(w, http.StatusBadGateway, "openlist read failed")
+		return
+	}
+	if group.KeyHash == "" || subtle.ConstantTimeCompare([]byte(group.KeyHash), []byte(req.KeyHash)) != 1 {
+		writeError(w, http.StatusUnauthorized, "clipboard key failed")
+		return
+	}
+	if !bytes.Equal(group.PublicKeyJWK, publicKeyJWK) {
+		writeError(w, http.StatusUnauthorized, "clipboard key failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"groupId": group.GroupID,
+		"name":    group.Name,
+	})
 }
 
 func (a *API) getIndex(w http.ResponseWriter, r *http.Request, groupID string) {
@@ -483,6 +553,22 @@ func clientIP(r *http.Request) string {
 func hash(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
+}
+
+func (a *API) createPasswordAllowed(password string) bool {
+	if a.cfg.CreatePassword == "" {
+		return true
+	}
+	return subtle.ConstantTimeCompare([]byte(password), []byte(a.cfg.CreatePassword)) == 1
+}
+
+func cleanGroupName(name string) string {
+	name = strings.TrimSpace(name)
+	name = strings.Join(strings.Fields(name), " ")
+	if len([]rune(name)) > 80 {
+		return string([]rune(name)[:80])
+	}
+	return name
 }
 
 func randomToken(bytesLen int) (string, error) {

@@ -1,14 +1,28 @@
-import type { BlobResponse, GroupAuth, IndexEvent, IndexResponse } from './types';
+import type { BlobResponse, GroupAuth, GroupMetadata, IndexEvent, IndexResponse } from './types';
 import { bytesToArrayBuffer, bytesToBase64Url } from './crypto';
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
-export async function createRemoteGroup(groupId: string, publicKeyJwk: JsonWebKey): Promise<void> {
-  await apiFetch('/api/v1/groups', {
+export async function createRemoteGroup(
+  groupId: string,
+  name: string,
+  keyHash: string,
+  publicKeyJwk: JsonWebKey,
+  createPassword: string
+): Promise<GroupMetadata> {
+  return apiFetch<GroupMetadata>('/api/v1/groups', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ groupId, publicKeyJwk })
+    body: JSON.stringify({ groupId, name, keyHash, publicKeyJwk, createPassword })
+  });
+}
+
+export async function joinRemoteGroup(groupId: string, keyHash: string, publicKeyJwk: JsonWebKey): Promise<GroupMetadata> {
+  return apiFetch<GroupMetadata>(`/api/v1/groups/${encodeURIComponent(groupId)}/join`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ keyHash, publicKeyJwk })
   });
 }
 

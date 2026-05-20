@@ -12,8 +12,11 @@ var ErrNotFound = errors.New("not found")
 type Group struct {
 	Version      int             `json:"version"`
 	GroupID      string          `json:"groupId"`
+	Name         string          `json:"name"`
+	KeyHash      string          `json:"keyHash"`
 	PublicKeyJWK json.RawMessage `json:"publicKeyJwk"`
 	CreatedAt    int64           `json:"createdAt"`
+	UpdatedAt    int64           `json:"updatedAt"`
 }
 
 type Store interface {

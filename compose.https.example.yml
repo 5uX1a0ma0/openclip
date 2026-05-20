@@ -31,6 +31,7 @@ services:
     environment:
       CLIPBOARD_ADDR: ":8080"
       CLIPBOARD_ALLOWED_ORIGIN: "${CLIPBOARD_ALLOWED_ORIGIN:-https://clipboard.example.com}"
+      CLIPBOARD_CREATE_PASSWORD: "${CLIPBOARD_CREATE_PASSWORD:-change-this-create-password}"
       CLIPBOARD_MAX_BLOB_BYTES: "${CLIPBOARD_MAX_BLOB_BYTES:-52428800}"
       OPENLIST_BASE_URL: "${OPENLIST_BASE_URL:-http://host.docker.internal:5244}"
       OPENLIST_USERNAME: "${OPENLIST_USERNAME:-clipboard}"

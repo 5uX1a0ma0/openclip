@@ -11,6 +11,7 @@ import (
 type Config struct {
 	Addr             string
 	AllowedOrigin    string
+	CreatePassword   string
 	MaxBlobBytes     int64
 	StaticDir        string
 	OpenListBaseURL  string
@@ -29,6 +30,7 @@ func Load() (Config, error) {
 	cfg := Config{
 		Addr:             env("CLIPBOARD_ADDR", ":8080"),
 		AllowedOrigin:    os.Getenv("CLIPBOARD_ALLOWED_ORIGIN"),
+		CreatePassword:   os.Getenv("CLIPBOARD_CREATE_PASSWORD"),
 		MaxBlobBytes:     envInt64("CLIPBOARD_MAX_BLOB_BYTES", 50*1024*1024),
 		StaticDir:        env("CLIPBOARD_STATIC_DIR", "frontend/dist"),
 		OpenListBaseURL:  strings.TrimRight(os.Getenv("OPENLIST_BASE_URL"), "/"),
@@ -47,6 +49,9 @@ func Load() (Config, error) {
 	}
 	if cfg.OpenListPassword == "" {
 		return Config{}, errors.New("OPENLIST_PASSWORD is required")
+	}
+	if cfg.CreatePassword == "" {
+		return Config{}, errors.New("CLIPBOARD_CREATE_PASSWORD is required")
 	}
 	if cfg.MaxBlobBytes <= 0 {
 		return Config{}, errors.New("CLIPBOARD_MAX_BLOB_BYTES must be positive")

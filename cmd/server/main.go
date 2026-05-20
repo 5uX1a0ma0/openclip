@@ -38,9 +38,10 @@ func main() {
 	cancel()
 
 	router := server.New(server.Config{
-		AllowedOrigin: cfg.AllowedOrigin,
-		MaxBlobBytes:  cfg.MaxBlobBytes,
-		StaticDir:     cfg.StaticDir,
+		AllowedOrigin:  cfg.AllowedOrigin,
+		CreatePassword: cfg.CreatePassword,
+		MaxBlobBytes:   cfg.MaxBlobBytes,
+		StaticDir:      cfg.StaticDir,
 	}, store)
 
 	srv := &http.Server{

@@ -46,8 +46,9 @@ export type SavedGroup = {
   id: string;
   name: string;
   vaultKey: string;
+  keyHash: string;
   publicKeyJwk: JsonWebKey;
-  privateKeyJwk: JsonWebKey;
+  privateKeyJwk?: JsonWebKey;
   invite: string;
   createdAt: number;
   updatedAt: number;
@@ -58,14 +59,12 @@ export type ActiveGroup = SavedGroup & {
   signingKey: CryptoKey;
 };
 
-export type GroupInvite = {
-  version: 1;
-  groupId: string;
-  vaultKey: string;
-  signingPrivateJwk: JsonWebKey;
-};
-
 export type GroupAuth = {
   id: string;
   signingKey: CryptoKey;
+};
+
+export type GroupMetadata = {
+  groupId: string;
+  name: string;
 };
