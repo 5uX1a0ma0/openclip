@@ -64,24 +64,33 @@ export function openIndexEvents(
 ): { close: () => void } {
   const controller = new AbortController();
   void (async () => {
-    onState('connecting');
-    try {
-      const response = await signedFetch(auth, `/api/v1/groups/${encodeURIComponent(auth.id)}/events`, {
-        method: 'GET',
-        signal: controller.signal
-      });
-      if (!response.body) {
-        throw new Error('实时连接不可用');
+    let retry = 0;
+    while (!controller.signal.aborted) {
+      onState('connecting');
+      try {
+        const response = await signedFetch(auth, `/api/v1/groups/${encodeURIComponent(auth.id)}/events`, {
+          method: 'GET',
+          signal: controller.signal
+        });
+        if (!response.body) {
+          throw new Error('实时连接不可用');
+        }
+        retry = 0;
+        onState('live');
+        await readEventStream(response.body, onIndex, controller.signal);
+        if (!controller.signal.aborted) {
+          onState('offline');
+          onError('实时连接已断开，正在重连');
+        }
+      } catch (err) {
+        if (!controller.signal.aborted) {
+          onState('offline');
+          onError(`${err instanceof Error ? err.message : String(err)}，正在重连`);
+        }
       }
-      onState('live');
-      await readEventStream(response.body, onIndex, controller.signal);
       if (!controller.signal.aborted) {
-        onState('offline');
-      }
-    } catch (err) {
-      if (!controller.signal.aborted) {
-        onState('offline');
-        onError(err instanceof Error ? err.message : String(err));
+        retry += 1;
+        await delay(reconnectDelay(retry), controller.signal);
       }
     }
   })();
@@ -91,6 +100,25 @@ export function openIndexEvents(
       onState('offline');
     }
   };
+}
+
+function reconnectDelay(retry: number) {
+  const base = Math.min(30_000, 1_000 * 2 ** Math.min(retry - 1, 5));
+  return base + Math.floor(Math.random() * 400);
+}
+
+function delay(ms: number, signal: AbortSignal) {
+  return new Promise<void>((resolve) => {
+    const timeout = window.setTimeout(resolve, ms);
+    signal.addEventListener(
+      'abort',
+      () => {
+        window.clearTimeout(timeout);
+        resolve();
+      },
+      { once: true }
+    );
+  });
 }
 
 async function signedJSON<T>(auth: GroupAuth, path: string, method: string, payload?: unknown): Promise<T> {

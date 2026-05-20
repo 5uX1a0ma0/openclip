@@ -194,7 +194,7 @@ export function mergeIndexes(remote: ClipIndex, local: ClipIndex): ClipIndex {
   return {
     version: 1,
     updatedAt: Date.now(),
-    clips: [...clips.values()].sort((a, b) => b.createdAt - a.createdAt),
+    clips: [...clips.values()].sort((a, b) => (b.lastUsedAt ?? b.createdAt) - (a.lastUsedAt ?? a.createdAt)),
     deleted: [...deleted.entries()].map(([id, deletedAt]) => ({ id, deletedAt }))
   };
 }
