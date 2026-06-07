@@ -4,12 +4,14 @@ import {
   Copy,
   Download,
   Eye,
+  EyeOff,
   FileIcon,
   FileText,
   ImageIcon,
   KeyRound,
   Loader2,
   LogOut,
+  Maximize2,
   Pin,
   PinOff,
   Plus,
@@ -66,10 +68,23 @@ const legacyDedupeMaxCandidates = 20;
 const cryptoUnavailable = webCryptoUnavailableReason();
 const syncEnabledStorageKey = 'openlist-clipboard.sync.enabled.v1';
 const syncStateStorageKey = 'openlist-clipboard.sync.state.v1';
+const scannerMaxEdge = 640;
+const scannerScanIntervalMs = 120;
+const maxToastCount = 3;
 
 type LiveState = 'offline' | 'connecting' | 'live';
 type IndexStream = { close: () => void };
 type SyncReason = 'enable' | 'focus' | 'visibility' | 'remote' | 'clipboardchange' | 'online';
+type ToastKind = 'success' | 'error' | 'info';
+type ToastMessage = {
+  id: number;
+  kind: ToastKind;
+  message: string;
+};
+type PersistentNotice = {
+  kind: 'info' | 'error';
+  message: string;
+};
 type ClipboardSnapshot = {
   kind: 'text' | 'image';
   bytes: Uint8Array;
@@ -111,12 +126,14 @@ export default function App() {
   const [busy, setBusy] = createSignal(false);
   const [syncing, setSyncing] = createSignal(false);
   const [operationLabel, setOperationLabel] = createSignal('');
-  const [status, setStatus] = createSignal('');
-  const [error, setError] = createSignal('');
+  const [persistentNotice, setPersistentNotice] = createSignal<PersistentNotice | null>(null);
+  const [toasts, setToasts] = createSignal<ToastMessage[]>([]);
   const [previewUrls, setPreviewUrls] = createSignal<Record<string, string>>({});
+  const [previewModalClipId, setPreviewModalClipId] = createSignal('');
   const [inviteQR, setInviteQR] = createSignal('');
   const [showInviteQR, setShowInviteQR] = createSignal(false);
   const [scannerOpen, setScannerOpen] = createSignal(false);
+  const [scannedInvite, setScannedInvite] = createSignal('');
   const [liveState, setLiveState] = createSignal<LiveState>('offline');
   const [clipboardSyncEnabled, setClipboardSyncEnabled] = createSignal(false);
 
@@ -125,12 +142,15 @@ export default function App() {
   let scannerStream: MediaStream | null = null;
   let scannerFrame = 0;
   let scannerDone = false;
+  let scannerLastScanAt = 0;
   let indexStream: IndexStream | null = null;
   let indexEventsVersion = 0;
   let liveRefreshRunning = false;
   let queuedIndexHash = '';
   let clipboardSyncRunning = false;
   let queuedClipboardSyncReason: SyncReason | null = null;
+  let toastID = 0;
+  const toastTimers = new Map<number, number>();
 
   const unlocked = createMemo(() => activeGroup() !== null);
   const activeClips = createMemo(() =>
@@ -138,6 +158,25 @@ export default function App() {
       .clips.filter((clip) => !isExpired(clip))
       .sort((a, b) => clipSortTime(b) - clipSortTime(a))
   );
+  const previewModalClip = createMemo(() => activeClips().find((clip) => clip.id === previewModalClipId()) || null);
+  const createFormHint = createMemo(() => {
+    if (cryptoUnavailable) {
+      return '';
+    }
+    const missingName = groupName().trim().length === 0;
+    const missingPassword = createPassword().trim().length === 0;
+    if (missingName && missingPassword) {
+      return '请输入剪贴板名称和创建密码。';
+    }
+    if (missingName) {
+      return '请输入剪贴板名称。';
+    }
+    if (missingPassword) {
+      return '请输入创建密码。';
+    }
+    return '';
+  });
+  const canCreateGroup = createMemo(() => !cryptoUnavailable && groupName().trim().length > 0 && createPassword().trim().length > 0);
 
   onMount(async () => {
     window.addEventListener('paste', handlePaste);
@@ -149,7 +188,7 @@ export default function App() {
     document.addEventListener('visibilitychange', handleVisibilityChange);
     clipboardEventTarget()?.addEventListener('clipboardchange', handleClipboardChange);
     if (cryptoUnavailable) {
-      setError(cryptoUnavailable);
+      setPersistentNotice({ kind: 'error', message: cryptoUnavailable });
     }
     const saved = loadSavedGroups();
     setGroups(saved);
@@ -180,10 +219,16 @@ export default function App() {
     closeIndexEvents();
     stopInviteScanner();
     Object.values(previewUrls()).forEach(URL.revokeObjectURL);
+    toastTimers.forEach((timer) => window.clearTimeout(timer));
+    toastTimers.clear();
   });
 
   async function createGroupAction(event: Event) {
     event.preventDefault();
+    if (!canCreateGroup()) {
+      showToast(createFormHint() || '请填写创建剪贴板所需信息。', 'error');
+      return;
+    }
     await run(async () => {
       const saved = await createSavedGroup(groupName());
       const remote = await createRemoteGroup(saved.id, saved.name, saved.keyHash, saved.publicKeyJwk, createPassword());
@@ -208,6 +253,7 @@ export default function App() {
       saveSavedGroups(next);
       setGroupName('');
       setInviteInput('');
+      setScannedInvite('');
       await activateExistingGroup(joined);
     }, '已加入剪贴板');
   }
@@ -236,6 +282,8 @@ export default function App() {
     setIndex(emptyIndex());
     setBaseHash('');
     setTextDraft('');
+    setPreviewModalClipId('');
+    setPersistentNotice(null);
   }
 
   function removeActiveGroup() {
@@ -250,7 +298,7 @@ export default function App() {
     setGroups(next);
     saveSavedGroups(next);
     leaveGroup();
-    setStatus('已从本机移除此剪贴板');
+    showToast('已从本机移除此剪贴板', 'success');
   }
 
   async function switchGroup(groupID: string) {
@@ -269,22 +317,34 @@ export default function App() {
     }, '二维码已生成');
   }
 
+  async function copyInviteKey() {
+    await run(async () => {
+      const nav = requireClipboardAccess();
+      if (typeof nav.writeText !== 'function') {
+        throw new Error('当前浏览器不支持复制文本。');
+      }
+      await nav.writeText(requireGroup().invite);
+    }, '剪贴板密钥已复制', '复制中');
+  }
+
   async function startInviteScanner() {
     if (cryptoUnavailable) {
-      setError(cryptoUnavailable);
+      showToast(cryptoUnavailable, 'error');
       return;
     }
     await run(async () => {
+      setScannedInvite('');
       setScannerOpen(true);
       try {
         await nextAnimationFrame();
         if (!scannerVideo || !scannerCanvas) {
-          throw new Error('QR scanner is not ready.');
+          throw new Error('二维码扫描器尚未就绪。');
         }
         if (!navigator.mediaDevices?.getUserMedia) {
-          throw new Error('Camera scanning is not available in this browser.');
+          throw new Error('当前浏览器不能使用摄像头扫描。');
         }
         scannerDone = false;
+        scannerLastScanAt = 0;
         scannerStream = await navigator.mediaDevices.getUserMedia({
           video: { facingMode: { ideal: 'environment' } },
           audio: false
@@ -299,25 +359,35 @@ export default function App() {
     }, '摄像头已打开');
   }
 
-  function scanInviteFrame() {
+  function scanInviteFrame(now = 0) {
     if (!scannerOpen() || scannerDone || !scannerVideo || !scannerCanvas) {
       return;
     }
+    if (now - scannerLastScanAt < scannerScanIntervalMs) {
+      scannerFrame = requestAnimationFrame(scanInviteFrame);
+      return;
+    }
+    scannerLastScanAt = now;
     if (scannerVideo.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && scannerVideo.videoWidth > 0) {
-      scannerCanvas.width = scannerVideo.videoWidth;
-      scannerCanvas.height = scannerVideo.videoHeight;
+      const scale = Math.min(1, scannerMaxEdge / Math.max(scannerVideo.videoWidth, scannerVideo.videoHeight));
+      scannerCanvas.width = Math.max(1, Math.round(scannerVideo.videoWidth * scale));
+      scannerCanvas.height = Math.max(1, Math.round(scannerVideo.videoHeight * scale));
       const context = scannerCanvas.getContext('2d', { willReadFrequently: true });
       if (context) {
         context.drawImage(scannerVideo, 0, 0, scannerCanvas.width, scannerCanvas.height);
         const decoded = decodeQRCodeFromCanvas(scannerCanvas);
         if (decoded) {
           if (!isInviteText(decoded)) {
-            setError('二维码不是有效的剪贴板密钥');
-          } else {
             scannerDone = true;
             stopInviteScanner();
+            showToast('二维码不是有效的剪贴板密钥。', 'error');
+            return;
+          } else {
+            scannerDone = true;
+            stopInviteScannerStream();
             setInviteInput(decoded);
-            void importGroupAction();
+            setScannedInvite(decoded);
+            showToast('已识别剪贴板密钥，请确认后加入。', 'info');
             return;
           }
         }
@@ -327,6 +397,12 @@ export default function App() {
   }
 
   function stopInviteScanner() {
+    stopInviteScannerStream();
+    setScannerOpen(false);
+    setScannedInvite('');
+  }
+
+  function stopInviteScannerStream() {
     if (scannerFrame) {
       cancelAnimationFrame(scannerFrame);
       scannerFrame = 0;
@@ -338,7 +414,16 @@ export default function App() {
     if (scannerVideo) {
       scannerVideo.srcObject = null;
     }
-    setScannerOpen(false);
+  }
+
+  async function joinScannedInvite() {
+    const decoded = scannedInvite();
+    if (!decoded) {
+      return;
+    }
+    setInviteInput(decoded);
+    stopInviteScanner();
+    await importGroupAction();
   }
 
   async function loadIndex(group = activeGroup()) {
@@ -391,15 +476,15 @@ export default function App() {
         if (version === indexEventsVersion) {
           setLiveState(state);
           if (state === 'connecting') {
-            setStatus('正在连接实时更新');
+            setPersistentNotice({ kind: 'info', message: '正在连接实时更新' });
           } else if (state === 'live') {
-            setStatus('实时更新已连接');
+            setPersistentNotice(null);
           }
         }
       },
       (message) => {
         if (version === indexEventsVersion) {
-          setStatus(message);
+          setPersistentNotice({ kind: 'info', message });
         }
       }
     );
@@ -441,12 +526,12 @@ export default function App() {
           changed = (await refreshIndex(group)) || changed;
         }
         if (changed) {
-          setStatus('已实时更新');
+          showToast('已实时更新', 'info');
           requestClipboardSync('remote');
         }
       } catch (err) {
         if (version === indexEventsVersion) {
-          setError(displayError(err));
+          showToast(displayError(err), 'error');
         }
       } finally {
         liveRefreshRunning = false;
@@ -622,10 +707,8 @@ export default function App() {
 
   async function readClipboard() {
     await run(async () => {
-      const nav = navigator.clipboard as Navigator['clipboard'] & {
-        read?: () => Promise<ClipboardItem[]>;
-      };
-      if (nav.read) {
+      const nav = requireClipboardAccess();
+      if (typeof nav.read === 'function') {
         const items = await nav.read();
         for (const item of items) {
           const imageType = item.types.find((type) => type.startsWith('image/'));
@@ -643,7 +726,10 @@ export default function App() {
           }
         }
       }
-      const text = await navigator.clipboard.readText();
+      if (typeof nav.readText !== 'function') {
+        throw new Error('当前浏览器不支持读取文本剪贴板。');
+      }
+      const text = await nav.readText();
       if (text.trim()) {
         const outcome = await addPlainBytes({
           bytes: textEncoder.encode(text),
@@ -660,18 +746,25 @@ export default function App() {
 
   async function copyClip(clip: ClipEntry) {
     await run(async () => {
+      if (!canCopyClip(clip)) {
+        throw new Error(clip.kind === 'image' ? '当前浏览器不支持复制图片到系统剪贴板。' : '文件不能复制到系统剪贴板，请使用下载。');
+      }
+      const nav = requireClipboardAccess();
       const plain = await plainBytes(clip);
       if (clip.kind === 'text') {
-        await navigator.clipboard.writeText(textDecoder.decode(plain));
+        if (typeof nav.writeText !== 'function') {
+          throw new Error('当前浏览器不支持复制文本。');
+        }
+        await nav.writeText(textDecoder.decode(plain));
         return;
       }
-      if (clip.kind === 'image' && 'ClipboardItem' in window && navigator.clipboard.write) {
+      if (clip.kind === 'image' && canWriteImageClipboard()) {
         const blob = new Blob([bytesToArrayBuffer(plain)], { type: clip.mime || 'image/png' });
-        await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
+        await nav.write([new ClipboardItem({ [blob.type]: blob })]);
         return;
       }
-      downloadPlain(clip, plain);
-    }, clip.kind === 'file' ? '已下载' : '已复制');
+      throw new Error('文件不能复制到系统剪贴板，请使用下载。');
+    }, '已复制');
   }
 
   function toggleClipboardSync(enabled: boolean) {
@@ -679,14 +772,19 @@ export default function App() {
     if (!group) {
       return;
     }
+    if (enabled && (!navigator.clipboard || !canWriteTextClipboard())) {
+      showToast('当前浏览器未开放剪贴板写入能力，请使用 HTTPS 或 localhost 访问。', 'error');
+      return;
+    }
     setClipboardSyncEnabled(enabled);
     saveSyncEnabled(group.id, enabled);
     clearQueuedClipboardSync();
     if (enabled) {
-      setStatus('剪贴板前台同步已开启');
+      showToast('剪贴板前台同步已开启', 'info');
       requestClipboardSync('enable');
     } else {
-      setStatus('剪贴板前台同步已关闭');
+      setPersistentNotice(null);
+      showToast('剪贴板前台同步已关闭', 'info');
     }
   }
 
@@ -706,7 +804,7 @@ export default function App() {
 
   function handleOffline() {
     setLiveState('offline');
-    setStatus('网络已离线，恢复后会重新连接');
+    setPersistentNotice({ kind: 'error', message: '网络已离线，恢复后会重新连接' });
   }
 
   function handleClipboardChange() {
@@ -728,9 +826,10 @@ export default function App() {
     if (liveState() !== 'live') {
       void refreshIndex(group)
         .then((changed) => {
-          setStatus(changed ? '已刷新远端内容' : '已连接，内容已是最新');
+          setPersistentNotice(null);
+          showToast(changed ? '已刷新远端内容' : '已连接，内容已是最新', 'info');
         })
-        .catch((err) => setError(displayError(err)));
+        .catch((err) => showToast(displayError(err), 'error'));
     }
   }
 
@@ -751,7 +850,7 @@ export default function App() {
         await syncClipboardNow(reason, groupID);
       } catch (err) {
         if (activeGroup()?.id === groupID && clipboardSyncEnabled()) {
-          setError(clipboardSyncError(err));
+          showToast(clipboardSyncError(err), 'error');
         }
       } finally {
         clipboardSyncRunning = false;
@@ -778,7 +877,7 @@ export default function App() {
     if (reason !== 'remote') {
       const changed = await refreshIndex(group);
       if (changed) {
-        setStatus('已刷新远端内容');
+        setPersistentNotice({ kind: 'info', message: '已刷新远端内容' });
       }
     }
 
@@ -827,7 +926,7 @@ export default function App() {
           remoteClipId: latest.id,
           remoteHash: latestHash
         });
-        setStatus('剪贴板内容已是最新');
+        setPersistentNotice({ kind: 'info', message: '剪贴板内容已是最新' });
         return;
       }
 
@@ -843,7 +942,7 @@ export default function App() {
             remoteClipId: outcome.clip.id,
             remoteHash: snapshot.hash
           });
-          setStatus(saveOutcomeMessage(outcome, '剪贴板内容已同步'));
+          setPersistentNotice({ kind: 'info', message: saveOutcomeMessage(outcome, '剪贴板内容已同步') });
           return;
         }
         await uploadClipboardSnapshot(snapshot, groupID);
@@ -875,7 +974,7 @@ export default function App() {
       remoteClipId: outcome.clip.id,
       remoteHash: snapshot.hash
     });
-    setStatus(saveOutcomeMessage(outcome, '已同步本机剪贴板'));
+    setPersistentNotice({ kind: 'info', message: saveOutcomeMessage(outcome, '已同步本机剪贴板') });
   }
 
   async function copyRemoteClipToClipboard(clip: ClipEntry, groupID: string) {
@@ -884,7 +983,15 @@ export default function App() {
       return;
     }
     if (clip.kind === 'file') {
-      setStatus('最新内容是文件，浏览器不能自动写入系统剪贴板');
+      setPersistentNotice({ kind: 'info', message: '最新内容是文件，浏览器不能自动写入系统剪贴板' });
+      return;
+    }
+    if (clip.kind === 'text' && !canWriteTextClipboard()) {
+      setPersistentNotice({ kind: 'error', message: '当前浏览器不支持自动写入文本剪贴板' });
+      return;
+    }
+    if (clip.kind === 'image' && !canWriteImageClipboard()) {
+      setPersistentNotice({ kind: 'info', message: '当前浏览器不支持自动写入图片剪贴板' });
       return;
     }
     const state = loadSyncState(groupID);
@@ -905,7 +1012,7 @@ export default function App() {
       const blob = new Blob([bytesToArrayBuffer(plain)], { type: clip.mime || 'image/png' });
       await nav.write([new ClipboardItem({ [blob.type]: blob })]);
     } else {
-      setStatus('此浏览器不能自动写入图片剪贴板');
+      setPersistentNotice({ kind: 'info', message: '当前浏览器不能自动写入图片剪贴板' });
       return;
     }
 
@@ -917,7 +1024,7 @@ export default function App() {
       remoteHash: hash,
       remoteCopiedAt: Date.now()
     });
-    setStatus('已同步到系统剪贴板');
+    setPersistentNotice({ kind: 'info', message: '已同步到系统剪贴板' });
   }
 
   async function clipPlainHash(clip: ClipEntry) {
@@ -1018,15 +1125,48 @@ export default function App() {
       return;
     }
     await run(async () => {
-      const plain = await plainBytes(clip);
-      const url = URL.createObjectURL(new Blob([bytesToArrayBuffer(plain)], { type: clip.mime || 'image/png' }));
-      setPreviewUrls((current) => {
-        if (current[clip.id]) {
-          URL.revokeObjectURL(current[clip.id]);
-        }
-        return { ...current, [clip.id]: url };
-      });
+      await ensurePreviewUrl(clip);
     }, '已解密预览');
+  }
+
+  async function openPreviewModal(clip: ClipEntry) {
+    if (clip.kind !== 'image') {
+      return;
+    }
+    await run(async () => {
+      await ensurePreviewUrl(clip);
+      setPreviewModalClipId(clip.id);
+    }, previewUrls()[clip.id] ? '已打开大图' : '已解密预览');
+  }
+
+  async function ensurePreviewUrl(clip: ClipEntry): Promise<string> {
+    const existing = previewUrls()[clip.id];
+    if (existing) {
+      return existing;
+    }
+    const plain = await plainBytes(clip);
+    const url = URL.createObjectURL(new Blob([bytesToArrayBuffer(plain)], { type: clip.mime || 'image/png' }));
+    setPreviewUrls((current) => {
+      if (current[clip.id]) {
+        URL.revokeObjectURL(current[clip.id]);
+      }
+      return { ...current, [clip.id]: url };
+    });
+    return url;
+  }
+
+  function collapsePreview(clip: ClipEntry) {
+    setPreviewModalClipId((current) => (current === clip.id ? '' : current));
+    setPreviewUrls((current) => {
+      const url = current[clip.id];
+      if (!url) {
+        return current;
+      }
+      URL.revokeObjectURL(url);
+      const next = { ...current };
+      delete next[clip.id];
+      return next;
+    });
   }
 
   async function plainBytes(clip: ClipEntry): Promise<Uint8Array> {
@@ -1054,6 +1194,7 @@ export default function App() {
         }
         return copy;
       });
+      setPreviewModalClipId((current) => (current === clip.id ? '' : current));
     }, '已删除');
   }
 
@@ -1139,17 +1280,33 @@ export default function App() {
   async function run(action: () => Promise<string | void>, ok: string, label = '处理中') {
     setBusy(true);
     setOperationLabel(label);
-    setError('');
-    setStatus('');
     try {
       const result = await action();
-      setStatus(result || ok);
+      showToast(result || ok, 'success');
     } catch (err) {
-      setError(displayError(err));
+      showToast(displayError(err), 'error');
     } finally {
       setBusy(false);
       setOperationLabel('');
     }
+  }
+
+  function showToast(message: string, kind: ToastKind = 'success') {
+    const id = toastID + 1;
+    toastID = id;
+    setToasts((current) => [...current, { id, kind, message }].slice(-maxToastCount));
+    const timeout = kind === 'error' ? 6500 : 2800;
+    const timer = window.setTimeout(() => dismissToast(id), timeout);
+    toastTimers.set(id, timer);
+  }
+
+  function dismissToast(id: number) {
+    const timer = toastTimers.get(id);
+    if (timer) {
+      window.clearTimeout(timer);
+      toastTimers.delete(id);
+    }
+    setToasts((current) => current.filter((toast) => toast.id !== id));
   }
 
   function requireGroup(): ActiveGroup {
@@ -1163,6 +1320,17 @@ export default function App() {
   function clearPreviewUrls() {
     Object.values(previewUrls()).forEach(URL.revokeObjectURL);
     setPreviewUrls({});
+    setPreviewModalClipId('');
+  }
+
+  function canCopyClip(clip: ClipEntry) {
+    if (clip.kind === 'text') {
+      return canWriteTextClipboard();
+    }
+    if (clip.kind === 'image') {
+      return canWriteImageClipboard();
+    }
+    return false;
   }
 
   return (
@@ -1212,6 +1380,10 @@ export default function App() {
         </div>
       </header>
 
+      <Show when={persistentNotice()}>
+        <div class={`status-strip ${persistentNotice()!.kind}`}>{persistentNotice()!.message}</div>
+      </Show>
+
       <Show when={!unlocked()}>
         <section class="key-panel">
           <div class="panel-title">
@@ -1228,18 +1400,23 @@ export default function App() {
               onInput={(event) => setGroupName(event.currentTarget.value)}
               placeholder="剪贴板名称"
               autocomplete="off"
+              required
             />
             <input
               type="password"
               value={createPassword()}
               onInput={(event) => setCreatePassword(event.currentTarget.value)}
-              placeholder="创建密码"
+              placeholder="创建密码（必填）"
               autocomplete="current-password"
+              required
             />
-            <button type="submit" disabled={busy() || !!cryptoUnavailable || groupName().trim().length === 0}>
+            <button type="submit" disabled={busy() || !canCreateGroup()}>
               <Plus size={17} />
               创建剪贴板
             </button>
+            <Show when={createFormHint()}>
+              <p class="form-hint">{createFormHint()}</p>
+            </Show>
           </form>
           <form class="group-form import-form" onSubmit={importGroupAction}>
             <div class="form-title">加入已有剪贴板</div>
@@ -1253,7 +1430,7 @@ export default function App() {
             <div class="composer-actions">
               <button type="button" onClick={() => void startInviteScanner()} disabled={busy() || !!cryptoUnavailable}>
                 <Camera size={17} />
-                Scan
+                扫描
               </button>
               <button type="submit" disabled={busy() || !!cryptoUnavailable || inviteInput().trim().length === 0}>
                 <Upload size={17} />
@@ -1287,7 +1464,7 @@ export default function App() {
 
         <section class="vault-strip">
           <span class="mono">{activeGroup()?.invite}</span>
-          <button class="icon-button" title="复制剪贴板密钥" onClick={() => void navigator.clipboard.writeText(requireGroup().invite)}>
+          <button class="icon-button" title="复制剪贴板密钥" disabled={busy()} onClick={() => void copyInviteKey()}>
             <Copy size={17} />
           </button>
           <button class="icon-button" title="生成剪贴板密钥二维码" onClick={() => void showInviteCodeQR()}>
@@ -1299,7 +1476,7 @@ export default function App() {
         </section>
 
         <section class="clip-list">
-          <Show when={activeClips().length > 0} fallback={<div class="empty">No clips</div>}>
+          <Show when={activeClips().length > 0} fallback={<div class="empty">暂无内容</div>}>
             <For each={activeClips()}>
               {(clip) => (
                 <article class="clip-card">
@@ -1322,17 +1499,33 @@ export default function App() {
                       <p class="text-preview">{clip.preview || '文本'}</p>
                     </Show>
                     <Show when={clip.kind === 'image' && previewUrls()[clip.id]}>
-                      <img class="preview" src={previewUrls()[clip.id]} alt={clip.name} />
+                      <button class="preview-button" type="button" title="查看大图" disabled={busy()} onClick={() => void openPreviewModal(clip)}>
+                        <img class="preview" src={previewUrls()[clip.id]} alt={clip.name} />
+                      </button>
                     </Show>
                   </div>
                   <div class="clip-actions">
-                    <button class="icon-button" title="复制" disabled={busy()} onClick={() => void copyClip(clip)}>
-                      <Copy size={17} />
-                    </button>
-                    <Show when={clip.kind === 'image'}>
-                      <button class="icon-button" title="预览" disabled={busy()} onClick={() => void previewClip(clip)}>
-                        <Eye size={17} />
+                    <Show when={canCopyClip(clip)}>
+                      <button class="icon-button" title="复制" disabled={busy()} onClick={() => void copyClip(clip)}>
+                        <Copy size={17} />
                       </button>
+                    </Show>
+                    <Show when={clip.kind === 'image'}>
+                      <Show
+                        when={previewUrls()[clip.id]}
+                        fallback={
+                          <button class="icon-button" title="预览" disabled={busy()} onClick={() => void previewClip(clip)}>
+                            <Eye size={17} />
+                          </button>
+                        }
+                      >
+                        <button class="icon-button" title="查看大图" disabled={busy()} onClick={() => void openPreviewModal(clip)}>
+                          <Maximize2 size={17} />
+                        </button>
+                        <button class="icon-button" title="收起预览" disabled={busy()} onClick={() => collapsePreview(clip)}>
+                          <EyeOff size={17} />
+                        </button>
+                      </Show>
                     </Show>
                     <Show when={clip.kind !== 'text'}>
                       <button class="icon-button" title="下载" disabled={busy()} onClick={() => void downloadClip(clip)}>
@@ -1358,16 +1551,16 @@ export default function App() {
           <section class="modal-panel qr-panel" onClick={(event) => event.stopPropagation()}>
             <div class="modal-head">
               <h2>剪贴板密钥二维码</h2>
-              <button class="icon-button" title="Close" onClick={() => setShowInviteQR(false)}>
+              <button class="icon-button" title="关闭" onClick={() => setShowInviteQR(false)}>
                 <X size={17} />
               </button>
             </div>
             <p class="notice">剪贴板密钥包含完整访问权限，只分享给可信设备。</p>
             <Show when={inviteQR()}>
-              <img class="qr-image" src={inviteQR()} alt="Clipboard key QR" />
+              <img class="qr-image" src={inviteQR()} alt="剪贴板密钥二维码" />
             </Show>
             <div class="qr-actions">
-              <button onClick={() => void navigator.clipboard.writeText(requireGroup().invite)}>
+              <button onClick={() => void copyInviteKey()}>
                 <Copy size={17} />
                 复制密钥
               </button>
@@ -1381,19 +1574,66 @@ export default function App() {
           <section class="modal-panel scanner-panel" onClick={(event) => event.stopPropagation()}>
             <div class="modal-head">
               <h2>扫描剪贴板密钥</h2>
-              <button class="icon-button" title="Close" onClick={stopInviteScanner}>
+              <button class="icon-button" title="关闭" onClick={stopInviteScanner}>
                 <X size={17} />
               </button>
             </div>
-            <video class="scanner-video" ref={(el) => (scannerVideo = el)} muted playsinline />
-            <canvas ref={(el) => (scannerCanvas = el)} hidden />
+            <Show
+              when={scannedInvite()}
+              fallback={
+                <>
+                  <video class="scanner-video" ref={(el) => (scannerVideo = el)} muted playsinline />
+                  <canvas ref={(el) => (scannerCanvas = el)} hidden />
+                </>
+              }
+            >
+              <div class="scanner-result">
+                <p class="notice info">已识别剪贴板密钥，请确认后加入。</p>
+                <div class="scanner-key mono">{scannedInvite()}</div>
+                <div class="qr-actions">
+                  <button type="button" disabled={busy()} onClick={() => void joinScannedInvite()}>
+                    <Upload size={17} />
+                    加入剪贴板
+                  </button>
+                  <button type="button" class="secondary-button" disabled={busy()} onClick={() => void startInviteScanner()}>
+                    <Camera size={17} />
+                    重新扫描
+                  </button>
+                </div>
+              </div>
+            </Show>
           </section>
         </div>
       </Show>
 
-      <Show when={status() || error()}>
-        <div class={error() ? 'toast error' : 'toast'}>{error() || status()}</div>
+      <Show when={previewModalClip()}>
+        <div class="modal-backdrop image-backdrop" onClick={() => setPreviewModalClipId('')}>
+          <section class="modal-panel image-panel" onClick={(event) => event.stopPropagation()}>
+            <div class="modal-head">
+              <h2>{previewModalClip()!.name || '图片预览'}</h2>
+              <button class="icon-button" title="关闭" onClick={() => setPreviewModalClipId('')}>
+                <X size={17} />
+              </button>
+            </div>
+            <Show when={previewUrls()[previewModalClip()!.id]}>
+              <img class="image-preview-large" src={previewUrls()[previewModalClip()!.id]} alt={previewModalClip()!.name || '图片预览'} />
+            </Show>
+          </section>
+        </div>
       </Show>
+
+      <div class="toast-stack">
+        <For each={toasts()}>
+          {(toast) => (
+            <div class={`toast ${toast.kind}`}>
+              <span>{toast.message}</span>
+              <button class="toast-close" title="关闭提示" onClick={() => dismissToast(toast.id)}>
+                <X size={14} />
+              </button>
+            </div>
+          )}
+        </For>
+      </div>
     </main>
   );
 }
@@ -1464,6 +1704,15 @@ function normalizePastedFile(file: File, itemMime = ''): File {
 
 function canAttemptForegroundSync() {
   return document.visibilityState === 'visible' && document.hasFocus();
+}
+
+function canWriteTextClipboard() {
+  return typeof navigator.clipboard?.writeText === 'function';
+}
+
+function canWriteImageClipboard() {
+  const clipboard = navigator.clipboard as (Clipboard & { write?: (items: ClipboardItem[]) => Promise<void> }) | undefined;
+  return typeof ClipboardItem !== 'undefined' && typeof clipboard?.write === 'function';
 }
 
 function clipboardEventTarget(): (EventTarget & {
@@ -1570,6 +1819,9 @@ function clipboardSyncError(err: unknown) {
 
 function displayError(err: unknown) {
   const message = err instanceof Error ? err.message : String(err);
+  if (err instanceof DOMException && (err.name === 'NotAllowedError' || err.name === 'SecurityError')) {
+    return '浏览器拒绝本次剪贴板操作。请确认页面在前台，并允许此站点读写剪贴板。';
+  }
   if (err instanceof DOMException && err.name === 'OperationError') {
     return '操作失败：浏览器加密、签名或文件读取没有返回具体原因。请确认剪贴板密钥匹配，并把过大的内容拆小后重试。';
   }

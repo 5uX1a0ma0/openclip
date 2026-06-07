@@ -3,6 +3,7 @@ import {
   deriveGroupId,
   deriveKeyHash,
   deriveSigningIdentity,
+  deriveSigningKey,
   generateVaultKey,
   importVaultKey
 } from './crypto';
@@ -57,7 +58,12 @@ export async function savedGroupFromInvite(inviteText: string, name = ''): Promi
 
 export async function activateGroup(group: SavedGroup): Promise<ActiveGroup> {
   const vaultCryptoKey = await importVaultKey(group.vaultKey);
-  const signingKey = (await deriveSigningIdentity(group.vaultKey)).signingKey;
+  let signingKey: CryptoKey;
+  try {
+    signingKey = await deriveSigningKey(group.vaultKey, group.publicKeyJwk);
+  } catch {
+    signingKey = (await deriveSigningIdentity(group.vaultKey)).signingKey;
+  }
   return { ...group, vaultCryptoKey, signingKey };
 }
 
@@ -110,7 +116,7 @@ async function savedGroupFromVaultKey(vaultKey: string, name: string): Promise<S
   const now = Date.now();
   return {
     id: groupId,
-    name: name || `Clipboard ${groupId.slice(0, 8)}`,
+    name: name || `剪贴板 ${groupId.slice(0, 8)}`,
     vaultKey,
     keyHash,
     publicKeyJwk: identity.publicKeyJwk,

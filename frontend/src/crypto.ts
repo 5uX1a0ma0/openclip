@@ -30,10 +30,10 @@ export function emptyIndex(): ClipIndex {
 
 export function webCryptoUnavailableReason(): string | null {
   if (!globalThis.crypto || typeof globalThis.crypto.getRandomValues !== 'function') {
-    return 'Web Crypto is not available in this browser.';
+    return '当前浏览器不支持 Web Crypto。';
   }
   if (!globalThis.crypto.subtle) {
-    return 'Web Crypto requires HTTPS or localhost. Open this app with https:// or http://localhost, not http://server-ip.';
+    return 'Web Crypto 需要 HTTPS 或 localhost。请用 https:// 或 http://localhost 打开，不要使用普通 http://server-ip。';
   }
   return null;
 }
@@ -48,7 +48,7 @@ export function generateVaultKey(): string {
 export async function importVaultKey(encoded: string): Promise<CryptoKey> {
   const raw = vaultKeyBytes(encoded);
   if (raw.byteLength !== 32) {
-    throw new Error('vault key must be 32 bytes');
+    throw new Error('剪贴板密钥必须是 32 字节');
   }
   return requireSubtleCrypto().importKey('raw', bytesToArrayBuffer(raw), 'AES-GCM', false, ['encrypt', 'decrypt']);
 }
@@ -72,16 +72,31 @@ export async function deriveKeyHash(vaultKey: string): Promise<string> {
 }
 
 export async function deriveSigningIdentity(vaultKey: string): Promise<SigningIdentity> {
+  const scalar = await deriveSigningScalar(vaultKey);
+  const publicKeyJwk = publicSigningKeyJwk(scalar);
+  return {
+    publicKeyJwk,
+    signingKey: await importSigningKey(scalar, publicKeyJwk)
+  };
+}
+
+export async function deriveSigningKey(vaultKey: string, publicKeyJwk: JsonWebKey): Promise<CryptoKey> {
+  return importSigningKey(await deriveSigningScalar(vaultKey), publicKeyJwk);
+}
+
+async function deriveSigningScalar(vaultKey: string): Promise<bigint> {
   const seed = new Uint8Array(
     await requireSubtleCrypto().digest('SHA-256', bytesToArrayBuffer(domainSeparatedBytes(signingKeyDomain, vaultKeyBytes(vaultKey))))
   );
-  const scalar = (bytesToBigInt(seed) % (p256N - 1n)) + 1n;
+  return (bytesToBigInt(seed) % (p256N - 1n)) + 1n;
+}
+
+function publicSigningKeyJwk(scalar: bigint): JsonWebKey {
   const publicPoint = scalarBaseMult(scalar);
   if (!publicPoint) {
     throw new Error('无法从剪贴板密钥派生签名身份');
   }
 
-  const d = bytesToBase64Url(bigIntToBytes(scalar));
   const x = bytesToBase64Url(bigIntToBytes(publicPoint.x));
   const y = bytesToBase64Url(bigIntToBytes(publicPoint.y));
   const publicKeyJwk: JsonWebKey = {
@@ -92,19 +107,22 @@ export async function deriveSigningIdentity(vaultKey: string): Promise<SigningId
     ext: true,
     key_ops: ['verify']
   };
+  return publicKeyJwk;
+}
+
+async function importSigningKey(scalar: bigint, publicKeyJwk: JsonWebKey): Promise<CryptoKey> {
   const signingJwk: JsonWebKey = {
     ...publicKeyJwk,
-    d,
+    d: bytesToBase64Url(bigIntToBytes(scalar)),
     key_ops: ['sign']
   };
-  const signingKey = await requireSubtleCrypto().importKey(
+  return requireSubtleCrypto().importKey(
     'jwk',
     signingJwk,
     { name: 'ECDSA', namedCurve: 'P-256' },
     false,
     ['sign']
   );
-  return { publicKeyJwk, signingKey };
 }
 
 export async function encryptBytes(key: CryptoKey, plaintext: Uint8Array): Promise<Uint8Array> {
@@ -132,11 +150,11 @@ export async function encryptBytes(key: CryptoKey, plaintext: Uint8Array): Promi
 
 export async function decryptBytes(key: CryptoKey, envelope: Uint8Array): Promise<Uint8Array> {
   if (envelope.length <= magic.length + 12) {
-    throw new Error('ciphertext is too short');
+    throw new Error('密文长度过短');
   }
   for (let i = 0; i < magic.length; i += 1) {
     if (envelope[i] !== magic[i]) {
-      throw new Error('unsupported ciphertext format');
+      throw new Error('不支持的密文格式');
     }
   }
   const nonce = envelope.slice(magic.length, magic.length + 12);
