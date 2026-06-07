@@ -9,17 +9,18 @@ import (
 )
 
 type Config struct {
-	Addr             string
-	AllowedOrigin    string
-	CreatePassword   string
-	MaxBlobBytes     int64
-	StaticDir        string
-	OpenListBaseURL  string
-	OpenListUsername string
-	OpenListPassword string
-	OpenListOTPCode  string
-	OpenListRoot     string
-	OpenListClientID string
+	Addr              string
+	AllowedOrigin     string
+	CreatePassword    string
+	MaxBlobBytes      int64
+	TrustProxyHeaders bool
+	StaticDir         string
+	OpenListBaseURL   string
+	OpenListUsername  string
+	OpenListPassword  string
+	OpenListOTPCode   string
+	OpenListRoot      string
+	OpenListClientID  string
 }
 
 func Load() (Config, error) {
@@ -28,17 +29,18 @@ func Load() (Config, error) {
 	}
 
 	cfg := Config{
-		Addr:             env("CLIPBOARD_ADDR", ":8080"),
-		AllowedOrigin:    os.Getenv("CLIPBOARD_ALLOWED_ORIGIN"),
-		CreatePassword:   os.Getenv("CLIPBOARD_CREATE_PASSWORD"),
-		MaxBlobBytes:     envInt64("CLIPBOARD_MAX_BLOB_BYTES", 50*1024*1024),
-		StaticDir:        env("CLIPBOARD_STATIC_DIR", "frontend/dist"),
-		OpenListBaseURL:  strings.TrimRight(os.Getenv("OPENLIST_BASE_URL"), "/"),
-		OpenListUsername: os.Getenv("OPENLIST_USERNAME"),
-		OpenListPassword: os.Getenv("OPENLIST_PASSWORD"),
-		OpenListOTPCode:  os.Getenv("OPENLIST_OTP_CODE"),
-		OpenListRoot:     cleanRoot(env("OPENLIST_ROOT", "/clipboard")),
-		OpenListClientID: env("OPENLIST_CLIENT_ID", "openlist-clipboard-gateway"),
+		Addr:              env("CLIPBOARD_ADDR", ":8080"),
+		AllowedOrigin:     os.Getenv("CLIPBOARD_ALLOWED_ORIGIN"),
+		CreatePassword:    os.Getenv("CLIPBOARD_CREATE_PASSWORD"),
+		MaxBlobBytes:      envInt64("CLIPBOARD_MAX_BLOB_BYTES", 50*1024*1024),
+		TrustProxyHeaders: envBool("CLIPBOARD_TRUST_PROXY_HEADERS", false),
+		StaticDir:         env("CLIPBOARD_STATIC_DIR", "frontend/dist"),
+		OpenListBaseURL:   strings.TrimRight(os.Getenv("OPENLIST_BASE_URL"), "/"),
+		OpenListUsername:  os.Getenv("OPENLIST_USERNAME"),
+		OpenListPassword:  os.Getenv("OPENLIST_PASSWORD"),
+		OpenListOTPCode:   os.Getenv("OPENLIST_OTP_CODE"),
+		OpenListRoot:      cleanRoot(env("OPENLIST_ROOT", "/clipboard")),
+		OpenListClientID:  env("OPENLIST_CLIENT_ID", "openlist-clipboard-gateway"),
 	}
 
 	if cfg.OpenListBaseURL == "" {
@@ -52,6 +54,12 @@ func Load() (Config, error) {
 	}
 	if cfg.CreatePassword == "" {
 		return Config{}, errors.New("CLIPBOARD_CREATE_PASSWORD is required")
+	}
+	if placeholderSecret(cfg.CreatePassword) {
+		return Config{}, errors.New("CLIPBOARD_CREATE_PASSWORD must not use an example value")
+	}
+	if placeholderSecret(cfg.OpenListPassword) {
+		return Config{}, errors.New("OPENLIST_PASSWORD must not use an example value")
 	}
 	if cfg.MaxBlobBytes <= 0 {
 		return Config{}, errors.New("CLIPBOARD_MAX_BLOB_BYTES must be positive")
@@ -109,6 +117,19 @@ func envInt64(key string, fallback int64) int64 {
 		return fallback
 	}
 	return parsed
+}
+
+func envBool(key string, fallback bool) bool {
+	value := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	if value == "" {
+		return fallback
+	}
+	return value == "1" || value == "true" || value == "yes" || value == "on"
+}
+
+func placeholderSecret(value string) bool {
+	value = strings.TrimSpace(strings.ToLower(value))
+	return strings.HasPrefix(value, "change-this") || value == "changeme" || value == "password"
 }
 
 func cleanRoot(root string) string {

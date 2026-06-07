@@ -10,9 +10,17 @@
   box-sizing: border-box;
 }
 
+html,
+body,
+#root {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: hidden;
+}
+
 body {
   margin: 0;
-  min-width: 320px;
+  min-width: 0;
   min-height: 100vh;
 }
 
@@ -20,6 +28,8 @@ button,
 input,
 select,
 textarea {
+  max-width: 100%;
+  min-width: 0;
   font: inherit;
 }
 
@@ -45,12 +55,18 @@ button:disabled {
   justify-content: space-between;
   gap: 16px;
   min-height: 56px;
+  min-width: 0;
 }
 
 .brand {
   display: flex;
   align-items: center;
   gap: 12px;
+  min-width: 0;
+}
+
+.brand > div:last-child {
+  min-width: 0;
 }
 
 .brand-mark,
@@ -66,6 +82,7 @@ button:disabled {
 
 .brand h1 {
   margin: 0;
+  overflow-wrap: anywhere;
   font-size: 22px;
   line-height: 1.1;
 }
@@ -90,6 +107,7 @@ button:disabled {
 .top-actions {
   flex-wrap: wrap;
   justify-content: flex-end;
+  min-width: 0;
 }
 
 .auth-panel,
@@ -127,7 +145,7 @@ button:disabled {
 }
 
 .group-select {
-  width: min(220px, 36vw);
+  width: clamp(150px, 30vw, 220px);
   background: #fbfcfb;
 }
 
@@ -253,6 +271,31 @@ button:hover,
   background: #fbf2ca;
 }
 
+.busy-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid #bdd5df;
+  border-radius: 8px;
+  color: #154f63;
+  background: #e6f4f8;
+  font-size: 13px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.spin {
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .sync-toggle {
   display: inline-flex;
   align-items: center;
@@ -346,9 +389,10 @@ button:hover,
 
 .composer {
   display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 12px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
   padding: 14px;
+  min-width: 0;
 }
 
 .composer-actions {
@@ -371,10 +415,11 @@ button:hover,
 
 .vault-strip {
   display: grid;
-  grid-template-columns: 1fr auto auto auto;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
   gap: 8px;
   align-items: center;
   padding: 10px;
+  min-width: 0;
 }
 
 .mono {
@@ -395,10 +440,11 @@ button:hover,
 
 .clip-card {
   display: grid;
-  grid-template-columns: 38px 1fr auto;
+  grid-template-columns: 38px minmax(0, 1fr) auto;
   gap: 12px;
   align-items: start;
   min-height: 78px;
+  min-width: 0;
   padding: 14px;
   border: 1px solid #d9e2de;
   border-radius: 8px;
@@ -414,6 +460,7 @@ button:hover,
   align-items: baseline;
   justify-content: space-between;
   gap: 12px;
+  min-width: 0;
 }
 
 .clip-head strong {
@@ -435,6 +482,11 @@ button:hover,
   -webkit-line-clamp: 2;
 }
 
+.clip-main .text-preview {
+  margin-top: 0;
+  font-size: 15px;
+}
+
 .preview {
   display: block;
   width: min(360px, 100%);
@@ -448,7 +500,8 @@ button:hover,
 .clip-actions {
   justify-content: flex-end;
   flex-wrap: wrap;
-  width: 200px;
+  width: auto;
+  max-width: 200px;
 }
 
 .empty {
@@ -460,8 +513,9 @@ button:hover,
 
 .toast {
   position: fixed;
-  right: 18px;
-  bottom: 18px;
+  top: max(12px, env(safe-area-inset-top));
+  left: max(12px, env(safe-area-inset-left));
+  z-index: 30;
   max-width: min(420px, calc(100vw - 36px));
   padding: 12px 14px;
   border-radius: 8px;
@@ -541,7 +595,8 @@ button:hover,
 
 @media (max-width: 720px) {
   .app {
-    width: min(100vw - 20px, 680px);
+    width: calc(100vw - 20px);
+    max-width: 680px;
     padding-top: 14px;
   }
 
@@ -553,23 +608,39 @@ button:hover,
 
   .top-actions {
     width: 100%;
+    justify-content: flex-start;
   }
 
   .composer {
     grid-template-columns: 1fr;
+    gap: 8px;
   }
 
   .composer-actions {
     flex-direction: row;
+    flex-wrap: wrap;
+  }
+
+  .composer .composer-actions {
+    gap: 8px;
+  }
+
+  .composer .file-button,
+  .composer .composer-actions > button {
+    flex: 1 1 0;
+    width: auto;
+    min-width: 0;
+    height: 40px;
   }
 
   .clip-card {
-    grid-template-columns: 38px 1fr;
+    grid-template-columns: 38px minmax(0, 1fr);
   }
 
   .clip-actions {
     grid-column: 1 / -1;
     width: 100%;
+    max-width: none;
     justify-content: flex-start;
   }
 
@@ -584,6 +655,10 @@ button:hover,
     width: 100%;
   }
 
+  .top-actions .group-select {
+    flex: 1 1 100%;
+  }
+
   .import-form {
     grid-template-columns: 1fr;
   }
@@ -594,6 +669,10 @@ button:hover,
   }
 
   .vault-strip {
-    grid-template-columns: 1fr auto auto auto;
+    grid-template-columns: minmax(0, 1fr) 40px 40px 40px;
+  }
+
+  .toast {
+    max-width: calc(100vw - 24px);
   }
 }

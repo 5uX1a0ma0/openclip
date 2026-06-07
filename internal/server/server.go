@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -14,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -33,19 +35,30 @@ var (
 )
 
 type Config struct {
-	AllowedOrigin  string
-	CreatePassword string
-	MaxBlobBytes   int64
-	StaticDir      string
+	AllowedOrigin     string
+	CreatePassword    string
+	MaxBlobBytes      int64
+	TrustProxyHeaders bool
+	StaticDir         string
 }
 
 type API struct {
-	cfg     Config
-	store   storage.Store
-	limiter *RateLimiter
-	events  *IndexEventHub
-	nonces  *NonceStore
+	cfg        Config
+	store      storage.Store
+	limiter    *RateLimiter
+	events     *IndexEventHub
+	nonces     *NonceStore
+	indexLocks [32]sync.Mutex
 }
+
+type signedBody struct {
+	size    int64
+	hashHex string
+	reader  io.ReadSeeker
+	cleanup func()
+}
+
+type signedBodyKey struct{}
 
 func New(cfg Config, store storage.Store) http.Handler {
 	if cfg.MaxBlobBytes <= 0 {
@@ -228,6 +241,10 @@ func (a *API) putIndex(w http.ResponseWriter, r *http.Request, groupID string) {
 		return
 	}
 
+	lock := a.indexLock(groupID)
+	lock.Lock()
+	defer lock.Unlock()
+
 	current, err := a.store.ReadIndex(r.Context(), groupID)
 	currentHash := ""
 	if err == nil {
@@ -312,26 +329,28 @@ func (a *API) postBlob(w http.ResponseWriter, r *http.Request, groupID string) {
 		writeError(w, http.StatusInternalServerError, "id generation failed")
 		return
 	}
-	body := http.MaxBytesReader(w, r.Body, a.cfg.MaxBlobBytes)
-	defer body.Close()
-	var buf bytes.Buffer
-	n, err := io.Copy(&buf, body)
-	if err != nil {
-		writeError(w, http.StatusRequestEntityTooLarge, "blob too large")
+
+	body := signedRequestBody(r)
+	if body == nil {
+		writeError(w, http.StatusBadRequest, "missing signed body")
 		return
 	}
-	if n != r.ContentLength {
+	if body.size != r.ContentLength {
 		writeError(w, http.StatusBadRequest, "short upload")
 		return
 	}
-	if err := a.store.WriteBlob(r.Context(), groupID, clipID, bytes.NewReader(buf.Bytes()), int64(buf.Len())); err != nil {
+	if _, err := body.reader.Seek(0, io.SeekStart); err != nil {
+		writeError(w, http.StatusInternalServerError, "upload rewind failed")
+		return
+	}
+	if err := a.store.WriteBlob(r.Context(), groupID, clipID, body.reader, body.size); err != nil {
 		writeError(w, http.StatusBadGateway, "openlist write failed")
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"clipId": clipID,
-		"size":   buf.Len(),
-		"hash":   hash(buf.Bytes()),
+		"size":   body.size,
+		"hash":   body.hashHex,
 	})
 }
 
@@ -351,6 +370,10 @@ func (a *API) getBlob(w http.ResponseWriter, r *http.Request, groupID string) {
 		return
 	}
 	defer body.Close()
+	if size > a.cfg.MaxBlobBytes {
+		writeError(w, http.StatusRequestEntityTooLarge, "blob too large")
+		return
+	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.bin"`, clipID))
 	if size >= 0 {
@@ -385,12 +408,18 @@ func (a *API) withGroupAuth(next func(http.ResponseWriter, *http.Request, string
 			return
 		}
 
-		body, err := readRequestBody(w, r, a.cfg.MaxBlobBytes+4096)
+		body, err := readSignedBody(w, r, a.cfg.MaxBlobBytes+4096)
 		if err != nil {
 			writeError(w, http.StatusRequestEntityTooLarge, "request too large")
 			return
 		}
-		r.Body = io.NopCloser(bytes.NewReader(body))
+		defer body.cleanup()
+		if _, err := body.reader.Seek(0, io.SeekStart); err != nil {
+			writeError(w, http.StatusInternalServerError, "request rewind failed")
+			return
+		}
+		r.Body = io.NopCloser(body.reader)
+		r = r.WithContext(contextWithSignedBody(r.Context(), body))
 
 		group, err := a.store.ReadGroup(r.Context(), groupID)
 		if err != nil {
@@ -406,7 +435,7 @@ func (a *API) withGroupAuth(next func(http.ResponseWriter, *http.Request, string
 			writeError(w, http.StatusBadGateway, "stored public key is invalid")
 			return
 		}
-		if !a.verifyRequest(r, body, groupID, publicKey) {
+		if !a.verifyRequest(r, body.hashHex, groupID, publicKey) {
 			writeError(w, http.StatusUnauthorized, "signature failed")
 			return
 		}
@@ -415,7 +444,7 @@ func (a *API) withGroupAuth(next func(http.ResponseWriter, *http.Request, string
 	}
 }
 
-func (a *API) verifyRequest(r *http.Request, body []byte, groupID string, publicKey *ecdsa.PublicKey) bool {
+func (a *API) verifyRequest(r *http.Request, bodyHashHex string, groupID string, publicKey *ecdsa.PublicKey) bool {
 	timestamp := r.Header.Get("X-Request-Timestamp")
 	nonce := r.Header.Get("X-Request-Nonce")
 	signature := r.Header.Get("X-Request-Signature")
@@ -430,12 +459,11 @@ func (a *API) verifyRequest(r *http.Request, body []byte, groupID string, public
 		return false
 	}
 
-	bodyHash := sha256.Sum256(body)
 	canonical := strings.Join([]string{
 		r.Method,
 		r.URL.EscapedPath(),
 		r.URL.RawQuery,
-		hex.EncodeToString(bodyHash[:]),
+		bodyHashHex,
 		timestamp,
 		nonce,
 	}, "\n")
@@ -476,7 +504,7 @@ func (a *API) cors(next http.Handler) http.Handler {
 
 func (a *API) rateLimit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		key := clientIP(r)
+		key := clientIP(r, a.cfg.TrustProxyHeaders)
 		if !a.limiter.Allow(key) {
 			writeError(w, http.StatusTooManyRequests, "too many requests")
 			return
@@ -530,19 +558,73 @@ func decodeJSON(r *http.Request, out any, limit int64) error {
 	return decoder.Decode(out)
 }
 
-func readRequestBody(w http.ResponseWriter, r *http.Request, limit int64) ([]byte, error) {
+func readSignedBody(w http.ResponseWriter, r *http.Request, limit int64) (*signedBody, error) {
 	if r.Body == nil {
-		return nil, nil
+		return newMemorySignedBody(nil), nil
 	}
 	body := http.MaxBytesReader(w, r.Body, limit)
 	defer body.Close()
-	return io.ReadAll(body)
+	if r.ContentLength >= 0 && r.ContentLength <= 1<<20 {
+		raw, err := io.ReadAll(body)
+		if err != nil {
+			return nil, err
+		}
+		return newMemorySignedBody(raw), nil
+	}
+
+	tmp, err := os.CreateTemp("", "openlist-clipboard-*")
+	if err != nil {
+		return nil, err
+	}
+	cleanup := func() {
+		name := tmp.Name()
+		_ = tmp.Close()
+		_ = os.Remove(name)
+	}
+	hasher := sha256.New()
+	n, err := io.Copy(io.MultiWriter(tmp, hasher), body)
+	if err != nil {
+		cleanup()
+		return nil, err
+	}
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		cleanup()
+		return nil, err
+	}
+	return &signedBody{
+		size:    n,
+		hashHex: hex.EncodeToString(hasher.Sum(nil)),
+		reader:  tmp,
+		cleanup: cleanup,
+	}, nil
 }
 
-func clientIP(r *http.Request) string {
-	host := r.RemoteAddr
-	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
-		host = strings.TrimSpace(strings.Split(forwarded, ",")[0])
+func newMemorySignedBody(raw []byte) *signedBody {
+	sum := sha256.Sum256(raw)
+	return &signedBody{
+		size:    int64(len(raw)),
+		hashHex: hex.EncodeToString(sum[:]),
+		reader:  bytes.NewReader(raw),
+		cleanup: func() {},
+	}
+}
+
+func contextWithSignedBody(ctx context.Context, body *signedBody) context.Context {
+	return context.WithValue(ctx, signedBodyKey{}, body)
+}
+
+func signedRequestBody(r *http.Request) *signedBody {
+	body, _ := r.Context().Value(signedBodyKey{}).(*signedBody)
+	return body
+}
+
+func clientIP(r *http.Request, trustProxyHeaders bool) string {
+	host := hostOnly(r.RemoteAddr)
+	if trustProxyHeaders {
+		forwarded := r.Header.Get("X-Forwarded-For")
+		if forwarded != "" {
+			host = hostOnly(strings.TrimSpace(strings.Split(forwarded, ",")[0]))
+		}
 	}
 	if host == "" {
 		return "unknown"
@@ -550,9 +632,22 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
+func hostOnly(value string) string {
+	host, _, err := net.SplitHostPort(value)
+	if err == nil {
+		return host
+	}
+	return strings.Trim(value, "[]")
+}
+
 func hash(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
+}
+
+func (a *API) indexLock(groupID string) *sync.Mutex {
+	sum := sha256.Sum256([]byte(groupID))
+	return &a.indexLocks[int(sum[0])%len(a.indexLocks)]
 }
 
 func (a *API) createPasswordAllowed(password string) bool {

@@ -9,8 +9,10 @@ export type ClipEntry = {
   preview: string;
   size: number;
   encryptedSize: number;
+  contentHash?: string;
   createdAt: number;
   updatedAt: number;
+  lastUsedAt?: number;
   expiresAt: number | null;
   pinned: boolean;
 };
