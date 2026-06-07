@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM node:20-alpine AS frontend-builder
+FROM node:26-alpine3.23 AS frontend-builder
 WORKDIR /src/frontend
 
 COPY frontend/package*.json ./
@@ -9,7 +9,7 @@ RUN npm install --no-audit --no-fund
 COPY frontend/ ./
 RUN npm run build
 
-FROM golang:1.22-alpine AS backend-builder
+FROM golang:1.26-alpine3.23 AS backend-builder
 WORKDIR /src
 
 COPY go.mod ./
@@ -18,7 +18,7 @@ COPY internal/ ./internal/
 
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/openlist-clipboard ./cmd/server
 
-FROM alpine:3.20
+FROM alpine:3.23
 WORKDIR /app
 
 RUN apk add --no-cache ca-certificates tzdata

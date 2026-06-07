@@ -28,6 +28,7 @@ func main() {
 		Root:     cfg.OpenListRoot,
 		ClientID: cfg.OpenListClientID,
 		Timeout:  45 * time.Second,
+		MaxBytes: cfg.MaxBlobBytes,
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -38,16 +39,20 @@ func main() {
 	cancel()
 
 	router := server.New(server.Config{
-		AllowedOrigin:  cfg.AllowedOrigin,
-		CreatePassword: cfg.CreatePassword,
-		MaxBlobBytes:   cfg.MaxBlobBytes,
-		StaticDir:      cfg.StaticDir,
+		AllowedOrigin:     cfg.AllowedOrigin,
+		CreatePassword:    cfg.CreatePassword,
+		MaxBlobBytes:      cfg.MaxBlobBytes,
+		TrustProxyHeaders: cfg.TrustProxyHeaders,
+		StaticDir:         cfg.StaticDir,
 	}, store)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           router,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 
 	go func() {

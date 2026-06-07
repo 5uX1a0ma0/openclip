@@ -143,6 +143,8 @@ func TestBlobRoundTrip(t *testing.T) {
 	}
 	var created struct {
 		ClipID string `json:"clipId"`
+		Size   int    `json:"size"`
+		Hash   string `json:"hash"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
 		t.Fatal(err)
@@ -150,12 +152,28 @@ func TestBlobRoundTrip(t *testing.T) {
 	if !clipIDPattern.MatchString(created.ClipID) {
 		t.Fatalf("invalid clip id: %s", created.ClipID)
 	}
+	if created.Size != len("ciphertext") || created.Hash != hash([]byte("ciphertext")) {
+		t.Fatalf("blob metadata size=%d hash=%s", created.Size, created.Hash)
+	}
 
 	get := signedRequest(t, http.MethodGet, "/api/v1/groups/"+group.id+"/blobs/"+created.ClipID, nil, group, "")
 	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, get)
 	if rec.Code != http.StatusOK || rec.Body.String() != "ciphertext" {
 		t.Fatalf("download status=%d body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestClientIPTrustProxyHeaders(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "10.0.0.5:12345"
+	req.Header.Set("X-Forwarded-For", "203.0.113.10, 10.0.0.5")
+
+	if got := clientIP(req, false); got != "10.0.0.5" {
+		t.Fatalf("clientIP without trust=%s", got)
+	}
+	if got := clientIP(req, true); got != "203.0.113.10" {
+		t.Fatalf("clientIP with trust=%s", got)
 	}
 }
 

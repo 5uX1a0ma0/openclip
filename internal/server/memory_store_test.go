@@ -64,7 +64,7 @@ func (m *memoryStore) WriteIndex(_ context.Context, groupID string, data []byte)
 	return nil
 }
 
-func (m *memoryStore) WriteBlob(_ context.Context, groupID string, clipID string, data io.Reader, _ int64) error {
+func (m *memoryStore) WriteBlob(_ context.Context, groupID string, clipID string, data io.ReadSeeker, _ int64) error {
 	raw, err := io.ReadAll(data)
 	if err != nil {
 		return err

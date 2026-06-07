@@ -483,8 +483,8 @@ export default function App() {
   }
 
   async function addText() {
-    const value = textDraft().trim();
-    if (!value) {
+    const value = textDraft();
+    if (!value.trim()) {
       return;
     }
     await run(async () => {
@@ -1096,13 +1096,16 @@ export default function App() {
   }
 
   function handlePaste(event: ClipboardEvent) {
-    if (!unlocked() || isTyping()) {
+    if (!unlocked()) {
       return;
     }
-    const files = [...(event.clipboardData?.files || [])];
+    const files = clipboardFilesFromPaste(event);
     if (files.length > 0) {
       event.preventDefault();
       files.forEach((file) => void addFile(file));
+      return;
+    }
+    if (isTyping()) {
       return;
     }
     const text = event.clipboardData?.getData('text/plain');
@@ -1266,7 +1269,7 @@ export default function App() {
           <textarea
             value={textDraft()}
             onInput={(event) => setTextDraft(event.currentTarget.value)}
-            placeholder="Paste text"
+            placeholder="粘贴文本"
             rows={4}
           />
           <div class="composer-actions">
@@ -1419,6 +1422,44 @@ function isTyping() {
     return false;
   }
   return ['INPUT', 'TEXTAREA', 'SELECT'].includes(element.tagName) || (element as HTMLElement).isContentEditable;
+}
+
+function clipboardFilesFromPaste(event: ClipboardEvent): File[] {
+  const data = event.clipboardData;
+  if (!data) {
+    return [];
+  }
+  const files = [...data.files].map((file) => normalizePastedFile(file));
+  if (files.length > 0) {
+    return files;
+  }
+  return [...data.items]
+    .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+    .map((item) => {
+      const file = item.getAsFile();
+      if (!file) {
+        return null;
+      }
+      if (file.name) {
+        return file;
+      }
+      return normalizePastedFile(file, item.type);
+    })
+    .filter((file): file is File => file !== null);
+}
+
+function normalizePastedFile(file: File, itemMime = ''): File {
+  if (file.name) {
+    return file;
+  }
+  const mime = file.type || itemMime || 'application/octet-stream';
+  const name = mime.startsWith('image/')
+    ? `clipboard-${Date.now()}.${imageExtension(mime)}`
+    : `clipboard-${Date.now()}.bin`;
+  return new File([file], name, {
+    type: mime,
+    lastModified: file.lastModified || Date.now()
+  });
 }
 
 function canAttemptForegroundSync() {

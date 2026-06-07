@@ -64,7 +64,8 @@ docker compose --env-file .env -f compose.yml up -d --build
 ```env
 CLIPBOARD_PUBLIC_URL=https://clipboard.example.com
 CLIPBOARD_ALLOWED_ORIGIN=https://clipboard.example.com
-CLIPBOARD_CREATE_PASSWORD=change-this-create-password
+CLIPBOARD_CREATE_PASSWORD=use-a-long-random-create-password
+CLIPBOARD_TRUST_PROXY_HEADERS=true
 ```
 
 ## 前台剪贴板同步

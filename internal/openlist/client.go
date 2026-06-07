@@ -32,6 +32,7 @@ type Config struct {
 	Root     string
 	ClientID string
 	Timeout  time.Duration
+	MaxBytes int64
 }
 
 type Client struct {
@@ -45,6 +46,9 @@ type Client struct {
 func NewClient(cfg Config) *Client {
 	if cfg.Timeout == 0 {
 		cfg.Timeout = 30 * time.Second
+	}
+	if cfg.MaxBytes <= 0 {
+		cfg.MaxBytes = 50 * 1024 * 1024
 	}
 	cfg.BaseURL = strings.TrimRight(cfg.BaseURL, "/")
 	cfg.Root = cleanRoot(cfg.Root)
@@ -75,7 +79,7 @@ func (c *Client) ReadGroup(ctx context.Context, groupID string) (storage.Group, 
 	if err != nil {
 		return storage.Group{}, err
 	}
-	raw, err := c.readFile(ctx, groupPath)
+	raw, err := c.readFile(ctx, groupPath, 1<<20)
 	if err != nil {
 		return storage.Group{}, err
 	}
@@ -109,7 +113,7 @@ func (c *Client) ReadIndex(ctx context.Context, groupID string) ([]byte, error) 
 	if err != nil {
 		return nil, err
 	}
-	return c.readFile(ctx, indexPath)
+	return c.readFile(ctx, indexPath, c.cfg.MaxBytes)
 }
 
 func (c *Client) WriteIndex(ctx context.Context, groupID string, data []byte) error {
@@ -123,7 +127,7 @@ func (c *Client) WriteIndex(ctx context.Context, groupID string, data []byte) er
 	return c.putFile(ctx, indexPath, bytes.NewReader(data), int64(len(data)))
 }
 
-func (c *Client) WriteBlob(ctx context.Context, groupID string, clipID string, data io.Reader, size int64) error {
+func (c *Client) WriteBlob(ctx context.Context, groupID string, clipID string, data io.ReadSeeker, size int64) error {
 	blobPath, err := c.blobPath(groupID, clipID)
 	if err != nil {
 		return err
@@ -142,6 +146,9 @@ func (c *Client) ReadBlob(ctx context.Context, groupID string, clipID string) (i
 	info, err := c.getFileInfo(ctx, blobPath)
 	if err != nil {
 		return nil, 0, err
+	}
+	if info.Size > c.cfg.MaxBytes {
+		return nil, 0, fmt.Errorf("openlist file too large: %d", info.Size)
 	}
 	if info.RawURL == "" {
 		return nil, 0, fmt.Errorf("openlist returned empty raw_url for %s", blobPath)
@@ -222,20 +229,16 @@ func (c *Client) mkdir(ctx context.Context, dir string) error {
 	return nil
 }
 
-func (c *Client) putFile(ctx context.Context, filePath string, data io.Reader, size int64) error {
-	raw, err := io.ReadAll(data)
-	if err != nil {
-		return err
-	}
-	if int64(len(raw)) != size {
-		return fmt.Errorf("file size mismatch: expected=%d actual=%d", size, len(raw))
-	}
+func (c *Client) putFile(ctx context.Context, filePath string, data io.ReadSeeker, size int64) error {
 	for attempt := 0; attempt < 2; attempt++ {
+		if _, err := data.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
 		token, err := c.authToken(ctx)
 		if err != nil {
 			return err
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.cfg.BaseURL+"/api/fs/put", bytes.NewReader(raw))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.cfg.BaseURL+"/api/fs/put", data)
 		if err != nil {
 			return err
 		}
@@ -260,10 +263,13 @@ func (c *Client) putFile(ctx context.Context, filePath string, data io.Reader, s
 	return errors.New("openlist upload failed after token refresh")
 }
 
-func (c *Client) readFile(ctx context.Context, filePath string) ([]byte, error) {
+func (c *Client) readFile(ctx context.Context, filePath string, limit int64) ([]byte, error) {
 	info, err := c.getFileInfo(ctx, filePath)
 	if err != nil {
 		return nil, err
+	}
+	if limit > 0 && info.Size > limit {
+		return nil, fmt.Errorf("openlist file too large: %d", info.Size)
 	}
 	if info.RawURL == "" {
 		return nil, fmt.Errorf("openlist returned empty raw_url for %s", filePath)
@@ -284,7 +290,21 @@ func (c *Client) readFile(ctx context.Context, filePath string) ([]byte, error) 
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		return nil, fmt.Errorf("download failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
-	return io.ReadAll(resp.Body)
+	return readLimited(resp.Body, limit)
+}
+
+func readLimited(reader io.Reader, limit int64) ([]byte, error) {
+	if limit <= 0 {
+		limit = 50 * 1024 * 1024
+	}
+	raw, err := io.ReadAll(io.LimitReader(reader, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(raw)) > limit {
+		return nil, fmt.Errorf("openlist file too large: %d", len(raw))
+	}
+	return raw, nil
 }
 
 type fileInfo struct {

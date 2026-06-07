@@ -390,7 +390,7 @@ button:hover,
 .composer {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
-  gap: 12px;
+  gap: 8px;
   padding: 14px;
   min-width: 0;
 }
@@ -613,11 +613,24 @@ button:hover,
 
   .composer {
     grid-template-columns: 1fr;
+    gap: 8px;
   }
 
   .composer-actions {
     flex-direction: row;
     flex-wrap: wrap;
+  }
+
+  .composer .composer-actions {
+    gap: 8px;
+  }
+
+  .composer .file-button,
+  .composer .composer-actions > button {
+    flex: 1 1 0;
+    width: auto;
+    min-width: 0;
+    height: 40px;
   }
 
   .clip-card {
