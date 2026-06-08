@@ -297,6 +297,7 @@ button:hover,
 }
 
 .sync-toggle {
+  position: relative;
   display: inline-flex;
   align-items: center;
   gap: 7px;
@@ -318,6 +319,15 @@ button:hover,
   height: 1px;
   opacity: 0;
   pointer-events: none;
+}
+
+.sync-toggle input:focus-visible + .sync-switch {
+  outline: 3px solid rgba(31, 111, 120, 0.18);
+  outline-offset: 2px;
+}
+
+.sync-toggle svg {
+  flex: 0 0 auto;
 }
 
 .sync-switch {

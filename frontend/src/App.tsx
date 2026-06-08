@@ -1,4 +1,5 @@
 import {
+  Bell,
   Camera,
   Clipboard as ClipboardIcon,
   Copy,
@@ -66,15 +67,19 @@ const maxClientPlainBytes = 50 * 1024 * 1024 - 64;
 const legacyDedupeMaxBytes = 2 * 1024 * 1024;
 const legacyDedupeMaxCandidates = 20;
 const cryptoUnavailable = webCryptoUnavailableReason();
+const notificationEnabledStorageKey = 'openlist-clipboard.notify.enabled.v1';
 const syncEnabledStorageKey = 'openlist-clipboard.sync.enabled.v1';
 const syncStateStorageKey = 'openlist-clipboard.sync.state.v1';
 const scannerMaxEdge = 640;
 const scannerScanIntervalMs = 120;
 const maxToastCount = 3;
+const notificationTitle = 'OpenList Clipboard';
+const updateNotificationBody = '剪贴板内容已更新';
 
 type LiveState = 'offline' | 'connecting' | 'live';
 type IndexStream = { close: () => void };
 type SyncReason = 'enable' | 'focus' | 'visibility' | 'remote' | 'clipboardchange' | 'online';
+type NotificationSupportState = NotificationPermission | 'unsupported';
 type ToastKind = 'success' | 'error' | 'info';
 type ToastMessage = {
   id: number;
@@ -136,6 +141,8 @@ export default function App() {
   const [scannedInvite, setScannedInvite] = createSignal('');
   const [liveState, setLiveState] = createSignal<LiveState>('offline');
   const [clipboardSyncEnabled, setClipboardSyncEnabled] = createSignal(false);
+  const [clipboardNotifyEnabled, setClipboardNotifyEnabled] = createSignal(false);
+  const [notificationPermission, setNotificationPermission] = createSignal<NotificationSupportState>(notificationPermissionState());
 
   let scannerVideo: HTMLVideoElement | undefined;
   let scannerCanvas: HTMLCanvasElement | undefined;
@@ -149,6 +156,9 @@ export default function App() {
   let queuedIndexHash = '';
   let clipboardSyncRunning = false;
   let queuedClipboardSyncReason: SyncReason | null = null;
+  let activeUpdateNotification: Notification | null = null;
+  let lastNotifiedGroupID = '';
+  let lastNotifiedIndexHash = '';
   let toastID = 0;
   const toastTimers = new Map<number, number>();
 
@@ -177,6 +187,22 @@ export default function App() {
     return '';
   });
   const canCreateGroup = createMemo(() => !cryptoUnavailable && groupName().trim().length > 0 && createPassword().trim().length > 0);
+  const notificationToggleTitle = createMemo(() => {
+    if (!clipboardNotifyEnabled()) {
+      return '远端更新通知';
+    }
+    const permission = notificationPermission();
+    if (permission === 'granted') {
+      return '远端更新通知：系统通知';
+    }
+    if (permission === 'denied') {
+      return '远端更新通知：系统通知已被拒绝，将使用页内提示';
+    }
+    if (permission === 'unsupported') {
+      return '远端更新通知：当前浏览器将使用页内提示';
+    }
+    return '远端更新通知：未授予系统通知权限，将使用页内提示';
+  });
 
   onMount(async () => {
     window.addEventListener('paste', handlePaste);
@@ -217,6 +243,7 @@ export default function App() {
     document.removeEventListener('visibilitychange', handleVisibilityChange);
     clipboardEventTarget()?.removeEventListener('clipboardchange', handleClipboardChange);
     closeIndexEvents();
+    closeUpdateNotification();
     stopInviteScanner();
     Object.values(previewUrls()).forEach(URL.revokeObjectURL);
     toastTimers.forEach((timer) => window.clearTimeout(timer));
@@ -263,8 +290,13 @@ export default function App() {
     closeIndexEvents();
     clearPreviewUrls();
     clearQueuedClipboardSync();
+    closeUpdateNotification();
+    lastNotifiedGroupID = '';
+    lastNotifiedIndexHash = '';
     setActiveGroup(opened);
     setClipboardSyncEnabled(loadSyncEnabled(opened.id));
+    setClipboardNotifyEnabled(loadNotificationEnabled(opened.id));
+    setNotificationPermission(notificationPermissionState());
     saveActiveGroupId(opened.id);
     setIndex(emptyIndex());
     setBaseHash('');
@@ -276,8 +308,12 @@ export default function App() {
     closeIndexEvents();
     clearPreviewUrls();
     clearQueuedClipboardSync();
+    closeUpdateNotification();
+    lastNotifiedGroupID = '';
+    lastNotifiedIndexHash = '';
     setActiveGroup(null);
     setClipboardSyncEnabled(false);
+    setClipboardNotifyEnabled(false);
     saveActiveGroupId('');
     setIndex(emptyIndex());
     setBaseHash('');
@@ -526,7 +562,7 @@ export default function App() {
           changed = (await refreshIndex(group)) || changed;
         }
         if (changed) {
-          showToast('已实时更新', 'info');
+          notifyRemoteClipboardUpdated(group);
           requestClipboardSync('remote');
         }
       } catch (err) {
@@ -786,6 +822,96 @@ export default function App() {
       setPersistentNotice(null);
       showToast('剪贴板前台同步已关闭', 'info');
     }
+  }
+
+  async function toggleClipboardNotification(enabled: boolean) {
+    const group = activeGroup();
+    if (!group) {
+      return;
+    }
+    setClipboardNotifyEnabled(enabled);
+    saveNotificationEnabled(group.id, enabled);
+    if (!enabled) {
+      closeUpdateNotification();
+      showToast('剪贴板更新通知已关闭', 'info');
+      return;
+    }
+
+    const groupID = group.id;
+    const permission = await requestSystemNotificationPermission();
+    setNotificationPermission(permission);
+    if (activeGroup()?.id !== groupID || !clipboardNotifyEnabled()) {
+      return;
+    }
+    if (permission === 'granted') {
+      showToast('剪贴板更新通知已开启', 'info');
+      return;
+    }
+    if (permission === 'denied') {
+      showToast('浏览器系统通知已被拒绝，将使用页内提示', 'info');
+      return;
+    }
+    if (permission === 'unsupported') {
+      showToast('当前浏览器不支持系统通知，将使用页内提示', 'info');
+      return;
+    }
+    showToast('未授予系统通知权限，将使用页内提示', 'info');
+  }
+
+  function notifyRemoteClipboardUpdated(group: ActiveGroup) {
+    if (activeGroup()?.id !== group.id || !clipboardNotifyEnabled()) {
+      return;
+    }
+    const hash = baseHash();
+    if (!hash || (lastNotifiedGroupID === group.id && lastNotifiedIndexHash === hash)) {
+      return;
+    }
+    lastNotifiedGroupID = group.id;
+    lastNotifiedIndexHash = hash;
+
+    const permission = notificationPermissionState();
+    setNotificationPermission(permission);
+    if (permission === 'granted') {
+      try {
+        closeUpdateNotification();
+        const notification = new Notification(notificationTitle, {
+          body: updateNotificationBody,
+          tag: `openlist-clipboard-update-${group.id}`
+        });
+        activeUpdateNotification = notification;
+        notification.onclick = () => {
+          window.focus();
+          notification.close();
+        };
+        notification.onclose = () => {
+          if (activeUpdateNotification === notification) {
+            activeUpdateNotification = null;
+          }
+        };
+        notification.onerror = () => {
+          if (activeUpdateNotification === notification) {
+            activeUpdateNotification = null;
+          }
+          showToast(updateNotificationBody, 'info');
+        };
+        return;
+      } catch {
+        setNotificationPermission(notificationPermissionState());
+      }
+    }
+    showToast(updateNotificationBody, 'info');
+  }
+
+  function closeUpdateNotification() {
+    if (!activeUpdateNotification) {
+      return;
+    }
+    const notification = activeUpdateNotification;
+    activeUpdateNotification = null;
+    notification.onclick = null;
+    notification.onclose = null;
+    notification.onerror = null;
+    notification.close();
   }
 
   function handleWindowFocus() {
@@ -1360,11 +1486,23 @@ export default function App() {
             <label class={`sync-toggle ${clipboardSyncEnabled() ? 'enabled' : ''}`} title="前台剪贴板同步">
               <input
                 type="checkbox"
+                aria-label="前台剪贴板同步"
                 checked={clipboardSyncEnabled()}
                 onChange={(event) => toggleClipboardSync(event.currentTarget.checked)}
               />
               <span class="sync-switch" />
               <span>同步</span>
+            </label>
+            <label class={`sync-toggle notification-toggle ${clipboardNotifyEnabled() ? 'enabled' : ''}`} title={notificationToggleTitle()}>
+              <input
+                type="checkbox"
+                aria-label="远端更新通知"
+                checked={clipboardNotifyEnabled()}
+                onChange={(event) => void toggleClipboardNotification(event.currentTarget.checked)}
+              />
+              <span class="sync-switch" />
+              <Bell size={14} />
+              <span>通知</span>
             </label>
             <span class={`live-pill ${liveState()}`}>{liveStateLabel(liveState())}</span>
             <Show when={busy() || syncing()}>
@@ -1755,18 +1893,67 @@ function imageExtension(mime: string) {
   return subtype || 'png';
 }
 
+function notificationPermissionState(): NotificationSupportState {
+  if (typeof window === 'undefined' || !window.isSecureContext || typeof Notification === 'undefined') {
+    return 'unsupported';
+  }
+  return Notification.permission;
+}
+
+function requestSystemNotificationPermission(): Promise<NotificationSupportState> {
+  if (notificationPermissionState() !== 'default') {
+    return Promise.resolve(notificationPermissionState());
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (permission: NotificationPermission) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve(permission);
+    };
+    try {
+      const result = (Notification.requestPermission as (
+        callback?: (permission: NotificationPermission) => void
+      ) => Promise<NotificationPermission> | void)(settle);
+      if (result && typeof result.then === 'function') {
+        result.then(settle, () => resolve(notificationPermissionState()));
+      }
+    } catch {
+      resolve(notificationPermissionState());
+    }
+  });
+}
+
+function loadNotificationEnabled(groupID: string) {
+  return loadGroupFlag(notificationEnabledStorageKey, groupID);
+}
+
+function saveNotificationEnabled(groupID: string, enabled: boolean) {
+  saveGroupFlag(notificationEnabledStorageKey, groupID, enabled);
+}
+
 function loadSyncEnabled(groupID: string) {
-  return readStorageObject(syncEnabledStorageKey)[groupID] === true;
+  return loadGroupFlag(syncEnabledStorageKey, groupID);
 }
 
 function saveSyncEnabled(groupID: string, enabled: boolean) {
-  const current = readStorageObject(syncEnabledStorageKey);
+  saveGroupFlag(syncEnabledStorageKey, groupID, enabled);
+}
+
+function loadGroupFlag(storageKey: string, groupID: string) {
+  return readStorageObject(storageKey)[groupID] === true;
+}
+
+function saveGroupFlag(storageKey: string, groupID: string, enabled: boolean) {
+  const current = readStorageObject(storageKey);
   if (enabled) {
     current[groupID] = true;
   } else {
     delete current[groupID];
   }
-  writeStorageObject(syncEnabledStorageKey, current);
+  writeStorageObject(storageKey, current);
 }
 
 function loadSyncState(groupID: string): StoredSyncState {
