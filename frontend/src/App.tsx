@@ -25,12 +25,15 @@ import {
 } from 'lucide-solid';
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from 'solid-js';
 import {
+  apiErrorStatus,
   createRemoteGroup,
   deleteBlob,
   downloadBlob,
   fetchIndex,
+  isFatalAuthOrGroupError,
   joinRemoteGroup,
   openIndexEvents,
+  remoteClipboardUnavailableMessage,
   saveIndex,
   uploadBlob
 } from './api';
@@ -152,6 +155,7 @@ export default function App() {
   let scannerLastScanAt = 0;
   let indexStream: IndexStream | null = null;
   let indexEventsVersion = 0;
+  let reconnectBlockedGroupID = '';
   let liveRefreshRunning = false;
   let queuedIndexHash = '';
   let clipboardSyncRunning = false;
@@ -291,6 +295,7 @@ export default function App() {
     clearPreviewUrls();
     clearQueuedClipboardSync();
     closeUpdateNotification();
+    reconnectBlockedGroupID = '';
     lastNotifiedGroupID = '';
     lastNotifiedIndexHash = '';
     setActiveGroup(opened);
@@ -309,6 +314,7 @@ export default function App() {
     clearPreviewUrls();
     clearQueuedClipboardSync();
     closeUpdateNotification();
+    reconnectBlockedGroupID = '';
     lastNotifiedGroupID = '';
     lastNotifiedIndexHash = '';
     setActiveGroup(null);
@@ -472,6 +478,7 @@ export default function App() {
   async function refreshAndReconnect() {
     await run(async () => {
       const group = requireGroup();
+      reconnectBlockedGroupID = '';
       const changed = await refreshIndex(group, true);
       if (liveState() !== 'live') {
         connectIndexEvents(group);
@@ -484,21 +491,31 @@ export default function App() {
   }
 
   async function refreshIndex(group: ActiveGroup, forceCleanup = false): Promise<boolean> {
-    const response = await fetchIndex(group);
-    if (response.hash === baseHash()) {
-      if (forceCleanup) {
-        await cleanupExpired(index(), group, response.hash);
+    try {
+      const response = await fetchIndex(group);
+      if (response.hash === baseHash()) {
+        if (forceCleanup) {
+          await cleanupExpired(index(), group, response.hash);
+        }
+        return false;
       }
-      return false;
+      const decrypted = await decryptIndex(group.vaultCryptoKey, response.blob);
+      setBaseHash(response.hash);
+      setIndex(decrypted);
+      await cleanupExpired(decrypted, group, response.hash);
+      return true;
+    } catch (err) {
+      handleRemoteFatalError(err, group);
+      throw err;
     }
-    const decrypted = await decryptIndex(group.vaultCryptoKey, response.blob);
-    setBaseHash(response.hash);
-    setIndex(decrypted);
-    await cleanupExpired(decrypted, group, response.hash);
-    return true;
   }
 
   function connectIndexEvents(group: ActiveGroup) {
+    if (reconnectBlockedGroupID === group.id) {
+      setLiveState('offline');
+      setPersistentNotice({ kind: 'error', message: remoteClipboardUnavailableMessage });
+      return;
+    }
     closeIndexEvents();
     const version = indexEventsVersion + 1;
     indexEventsVersion = version;
@@ -518,8 +535,14 @@ export default function App() {
           }
         }
       },
-      (message) => {
+      (message, terminal, err) => {
         if (version === indexEventsVersion) {
+          if (terminal) {
+            if (!handleRemoteFatalError(err, group, message)) {
+              stopRemoteReconnect(group, message);
+            }
+            return;
+          }
           setPersistentNotice({ kind: 'info', message });
         }
       }
@@ -567,6 +590,9 @@ export default function App() {
         }
       } catch (err) {
         if (version === indexEventsVersion) {
+          if (handleRemoteFatalError(err, group)) {
+            return;
+          }
           showToast(displayError(err), 'error');
         }
       } finally {
@@ -589,18 +615,24 @@ export default function App() {
       setBaseHash(saved.hash);
       return;
     } catch (err) {
-      if ((err as Error & { status?: number }).status !== 409) {
+      if (apiErrorStatus(err) !== 409) {
+        handleRemoteFatalError(err, group);
         throw err;
       }
     }
 
-    const remote = await fetchIndex(group);
-    const remoteIndex = await decryptIndex(group.vaultCryptoKey, remote.blob);
-    const merged = mergeIndexes(remoteIndex, next);
-    const mergedBlob = await encryptIndex(group.vaultCryptoKey, merged);
-    const saved = await saveIndex(group, remote.hash, mergedBlob);
-    setIndex(merged);
-    setBaseHash(saved.hash);
+    try {
+      const remote = await fetchIndex(group);
+      const remoteIndex = await decryptIndex(group.vaultCryptoKey, remote.blob);
+      const merged = mergeIndexes(remoteIndex, next);
+      const mergedBlob = await encryptIndex(group.vaultCryptoKey, merged);
+      const saved = await saveIndex(group, remote.hash, mergedBlob);
+      setIndex(merged);
+      setBaseHash(saved.hash);
+    } catch (err) {
+      handleRemoteFatalError(err, group);
+      throw err;
+    }
   }
 
   async function addText() {
@@ -658,7 +690,7 @@ export default function App() {
       return promoteDuplicateClip(duplicate, contentHash, group);
     }
     const encrypted = await encryptBytes(group.vaultCryptoKey, input.bytes);
-    const uploaded = await uploadBlob(group, encrypted);
+    const uploaded = await guardRemoteOperation(group, () => uploadBlob(group, encrypted));
     const now = Date.now();
     const clip: ClipEntry = {
       id: uploaded.clipId,
@@ -929,6 +961,10 @@ export default function App() {
   }
 
   function handleOffline() {
+    const group = activeGroup();
+    if (group && reconnectBlockedGroupID === group.id) {
+      return;
+    }
     setLiveState('offline');
     setPersistentNotice({ kind: 'error', message: '网络已离线，恢复后会重新连接' });
   }
@@ -940,6 +976,10 @@ export default function App() {
   function recoverForeground(reason: SyncReason) {
     const group = activeGroup();
     if (!group || cryptoUnavailable || !canAttemptForegroundSync()) {
+      return;
+    }
+    if (reconnectBlockedGroupID === group.id) {
+      setPersistentNotice({ kind: 'error', message: remoteClipboardUnavailableMessage });
       return;
     }
     if (liveState() !== 'live') {
@@ -964,6 +1004,10 @@ export default function App() {
     if (!group || !clipboardSyncEnabled() || cryptoUnavailable || !canAttemptForegroundSync()) {
       return;
     }
+    if (reconnectBlockedGroupID === group.id) {
+      setPersistentNotice({ kind: 'error', message: remoteClipboardUnavailableMessage });
+      return;
+    }
     if (clipboardSyncRunning) {
       queuedClipboardSyncReason = reason;
       return;
@@ -976,7 +1020,7 @@ export default function App() {
         await syncClipboardNow(reason, groupID);
       } catch (err) {
         if (activeGroup()?.id === groupID && clipboardSyncEnabled()) {
-          showToast(clipboardSyncError(err), 'error');
+          showToast(clipboardSyncOperationError(err), 'error');
         }
       } finally {
         clipboardSyncRunning = false;
@@ -1297,13 +1341,13 @@ export default function App() {
 
   async function plainBytes(clip: ClipEntry): Promise<Uint8Array> {
     const group = requireGroup();
-    return decryptBytes(group.vaultCryptoKey, await downloadBlob(group, clip.blobId));
+    return decryptBytes(group.vaultCryptoKey, await guardRemoteOperation(group, () => downloadBlob(group, clip.blobId)));
   }
 
   async function removeClip(clip: ClipEntry) {
     await run(async () => {
       const group = requireGroup();
-      await deleteBlob(group, clip.blobId);
+      await guardRemoteOperation(group, () => deleteBlob(group, clip.blobId));
       const now = Date.now();
       const next = {
         ...index(),
@@ -1352,7 +1396,11 @@ export default function App() {
       setIndex(currentIndex);
       return;
     }
-    await Promise.allSettled(expired.map((clip) => deleteBlob(group, clip.blobId)));
+    const deleteResults = await Promise.allSettled(expired.map((clip) => guardRemoteOperation(group, () => deleteBlob(group, clip.blobId))));
+    const fatalDelete = deleteResults.find((result) => result.status === 'rejected' && isFatalAuthOrGroupError(result.reason));
+    if (fatalDelete?.status === 'rejected') {
+      throw fatalDelete.reason;
+    }
     const next: ClipIndex = {
       ...currentIndex,
       updatedAt: now,
@@ -1360,6 +1408,52 @@ export default function App() {
       deleted: [...currentIndex.deleted, ...expired.map((clip) => ({ id: clip.id, deletedAt: now }))]
     };
     await persist(next, group, hash);
+  }
+
+  async function guardRemoteOperation<T>(group: ActiveGroup, action: () => Promise<T>): Promise<T> {
+    try {
+      return await action();
+    } catch (err) {
+      handleRemoteFatalError(err, group);
+      throw err;
+    }
+  }
+
+  function handleRemoteFatalError(err: unknown, group: ActiveGroup, message = remoteClipboardUnavailableMessage): boolean {
+    if (!isFatalAuthOrGroupError(err)) {
+      return false;
+    }
+    if (activeGroup()?.id !== group.id) {
+      return true;
+    }
+    stopRemoteReconnect(group, message);
+    return true;
+  }
+
+  function stopRemoteReconnect(group: ActiveGroup, message: string) {
+    if (activeGroup()?.id !== group.id) {
+      return;
+    }
+    reconnectBlockedGroupID = group.id;
+    closeIndexEvents();
+    clearQueuedClipboardSync();
+    setPersistentNotice({ kind: 'error', message });
+  }
+
+  function displayOperationError(err: unknown) {
+    const group = activeGroup();
+    if (group && reconnectBlockedGroupID === group.id && isFatalAuthOrGroupError(err)) {
+      return remoteClipboardUnavailableMessage;
+    }
+    return displayError(err);
+  }
+
+  function clipboardSyncOperationError(err: unknown) {
+    const group = activeGroup();
+    if (group && reconnectBlockedGroupID === group.id && isFatalAuthOrGroupError(err)) {
+      return remoteClipboardUnavailableMessage;
+    }
+    return clipboardSyncError(err);
   }
 
   function handlePaste(event: ClipboardEvent) {
@@ -1410,7 +1504,7 @@ export default function App() {
       const result = await action();
       showToast(result || ok, 'success');
     } catch (err) {
-      showToast(displayError(err), 'error');
+      showToast(displayOperationError(err), 'error');
     } finally {
       setBusy(false);
       setOperationLabel('');

@@ -1,11 +1,36 @@
+# Local environment
 .env
-.env.local
+.env.*
+!.env.example
+
+# Dependencies and build output
+node_modules/
+frontend/node_modules/
 dist/
 frontend/dist/
-frontend/node_modules/
 coverage/
+
+# Tool caches
+.vite/
+frontend/.vite/
+.turbo/
+.parcel-cache/
+.cache/
+
+# Editors and OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs and temporary artifacts
 *.log
-*.exe
-*.test
+*.tmp
 *.zip
 tmp/
+
+# Local binaries/test output
+*.exe
+*.test

@@ -4,6 +4,38 @@ import { bytesToArrayBuffer, bytesToBase64Url } from './crypto';
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
+export const remoteClipboardUnavailableMessage = '远端剪贴板不存在或密钥已失效，请刷新、切换或忘记本机记录后重新加入。';
+
+export class ApiError extends Error {
+  readonly status: number;
+  readonly detail: string;
+
+  constructor(status: number, message: string, detail = '') {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
+export function isApiError(err: unknown): err is ApiError {
+  return err instanceof ApiError || (err instanceof Error && typeof (err as { status?: unknown }).status === 'number');
+}
+
+export function apiErrorStatus(err: unknown): number | undefined {
+  return isApiError(err) ? err.status : undefined;
+}
+
+export function isFatalAuthOrGroupError(err: unknown): boolean {
+  if (!isApiError(err)) {
+    return false;
+  }
+  if (err.status === 401 || err.status === 403) {
+    return true;
+  }
+  return err.status === 404 && /group|clipboard|剪贴板/i.test(`${err.message} ${err.detail}`);
+}
+
 export async function createRemoteGroup(
   groupId: string,
   name: string,
@@ -60,7 +92,7 @@ export function openIndexEvents(
   auth: GroupAuth,
   onIndex: (event: IndexEvent) => void,
   onState: (state: 'connecting' | 'live' | 'offline') => void,
-  onError: (message: string) => void
+  onError: (message: string, terminal: boolean, error?: unknown) => void
 ): { close: () => void } {
   const controller = new AbortController();
   void (async () => {
@@ -80,12 +112,16 @@ export function openIndexEvents(
         await readEventStream(response.body, onIndex, controller.signal);
         if (!controller.signal.aborted) {
           onState('offline');
-          onError('实时连接已断开，正在重连');
+          onError('实时连接已断开，正在重连', false);
         }
       } catch (err) {
         if (!controller.signal.aborted) {
           onState('offline');
-          onError(`${err instanceof Error ? err.message : String(err)}，正在重连`);
+          if (isFatalIndexEventError(err)) {
+            onError(remoteClipboardUnavailableMessage, true, err);
+            return;
+          }
+          onError(`${errorMessage(err)}，正在重连`, false, err);
         }
       }
       if (!controller.signal.aborted) {
@@ -100,6 +136,13 @@ export function openIndexEvents(
       onState('offline');
     }
   };
+}
+
+function isFatalIndexEventError(err: unknown): boolean {
+  if (!isApiError(err)) {
+    return false;
+  }
+  return err.status === 400 || err.status === 401 || err.status === 403 || err.status === 404;
 }
 
 function reconnectDelay(retry: number) {
@@ -150,9 +193,7 @@ async function signedFetch(
     credentials: 'same-origin'
   });
   if (!response.ok) {
-    const error = new Error(await responseText(response)) as Error & { status?: number };
-    error.status = response.status;
-    throw error;
+    throw await apiErrorFromResponse(response);
   }
   return response;
 }
@@ -250,9 +291,7 @@ async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
     credentials: 'same-origin'
   });
   if (!response.ok) {
-    const error = new Error(await responseText(response)) as Error & { status?: number };
-    error.status = response.status;
-    throw error;
+    throw await apiErrorFromResponse(response);
   }
   if (response.status === 204) {
     return undefined as T;
@@ -260,11 +299,26 @@ async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+async function apiErrorFromResponse(response: Response): Promise<ApiError> {
+  const detail = await responseText(response);
+  return new ApiError(response.status, detail || response.statusText || `HTTP ${response.status}`, detail);
+}
+
 async function responseText(response: Response): Promise<string> {
   try {
     const data = await response.json();
-    return data.error || JSON.stringify(data);
+    if (typeof data?.error === 'string') {
+      return data.error;
+    }
+    if (typeof data?.message === 'string') {
+      return data.message;
+    }
+    return JSON.stringify(data);
   } catch {
     return response.statusText;
   }
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }

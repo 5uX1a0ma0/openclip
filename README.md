@@ -13,6 +13,11 @@
 
 ## 运行
 
+要求：
+
+- Go 1.26 或更新版本。
+- Node.js `^20.19.0 || >=22.12.0`。前端使用 Vite 8，低于此范围的 Node 版本会在安装或构建时报 engine 错误。
+
 1. 复制 `.env.example` 为 `.env` 并修改 OpenList 连接信息。
 2. 安装前端依赖并构建静态文件：
 
@@ -34,6 +39,8 @@
 
 ## Docker
 
+Dockerfile 使用 Node 26 构建前端、Go 1.26 构建后端，并把构建后的静态文件打进最终镜像。
+
 ```powershell
 docker build -t openlist-clipboard:local .
 docker run --rm -p 8080:8080 --env-file .env openlist-clipboard:local
@@ -51,6 +58,7 @@ docker compose --env-file .env -f compose.yml up -d --build
 ## HTTPS
 
 浏览器的 Web Crypto、剪贴板和摄像头能力都要求 HTTPS 或 localhost。生产部署不要用 `http://服务器IP:8080` 访问。
+`CLIPBOARD_ALLOWED_ORIGIN` 应设置为实际访问站点，反向代理后建议启用 `CLIPBOARD_TRUST_PROXY_HEADERS=true`。
 
 有域名时可以使用 Caddy 示例：
 
@@ -74,6 +82,8 @@ CLIPBOARD_TRUST_PROXY_HEADERS=true
 - 浏览器不会提供可靠的系统剪贴板修改时间；应用只能使用“本次观察到剪贴板变化的时间”与页面最新剪贴内容时间做近似判断。
 - 同步优先支持文本；图片在支持 `ClipboardItem` 的浏览器中可自动写入，普通文件不能跨浏览器自动写入系统剪贴板。
 - 实时列表刷新仍使用 SSE，不使用轮询；后台或未聚焦窗口中的剪贴板读写可能被浏览器拒绝。
+- 网络断开、OpenList 临时 `5xx` 或限流 `429` 会保持实时连接重试；远端剪贴板不存在、签名失败或密钥失效时会停止重连。
+- 停止重连不会自动删除本机保存的剪贴板密钥。用户可以手动刷新重试、切换剪贴板、忘记本机记录或重新加入。
 
 ## 剪贴板密钥
 
