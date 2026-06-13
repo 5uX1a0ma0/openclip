@@ -3,6 +3,14 @@
 .env.*
 !.env.example
 
+# Local notes
+todo.md
+TODO.md
+
+# Local tool state
+.codex/
+.agents/
+
 # Dependencies and build output
 node_modules/
 frontend/node_modules/
