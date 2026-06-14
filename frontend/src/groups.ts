@@ -4,8 +4,7 @@ import {
   deriveKeyHash,
   deriveSigningIdentity,
   deriveSigningKey,
-  generateVaultKey,
-  importVaultKey
+  generateVaultKey
 } from './crypto';
 import type { ActiveGroup, SavedGroup } from './types';
 
@@ -57,14 +56,13 @@ export async function savedGroupFromInvite(inviteText: string, name = ''): Promi
 }
 
 export async function activateGroup(group: SavedGroup): Promise<ActiveGroup> {
-  const vaultCryptoKey = await importVaultKey(group.vaultKey);
   let signingKey: CryptoKey;
   try {
     signingKey = await deriveSigningKey(group.vaultKey, group.publicKeyJwk);
   } catch {
     signingKey = (await deriveSigningIdentity(group.vaultKey)).signingKey;
   }
-  return { ...group, vaultCryptoKey, signingKey };
+  return { ...group, signingKey };
 }
 
 export function upsertGroup(groups: SavedGroup[], next: SavedGroup): SavedGroup[] {

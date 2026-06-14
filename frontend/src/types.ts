@@ -8,7 +8,6 @@ export type ClipEntry = {
   mime: string;
   preview: string;
   size: number;
-  encryptedSize: number;
   contentHash?: string;
   createdAt: number;
   updatedAt: number;
@@ -56,7 +55,6 @@ export type SavedGroup = {
 };
 
 export type ActiveGroup = SavedGroup & {
-  vaultCryptoKey: CryptoKey;
   signingKey: CryptoKey;
 };
 

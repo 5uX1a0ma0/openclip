@@ -134,7 +134,7 @@ func TestBlobRoundTrip(t *testing.T) {
 	group := newTestGroup(t, 1)
 	createGroup(t, handler, group, http.StatusCreated)
 
-	req := signedRequest(t, http.MethodPost, "/api/v1/groups/"+group.id+"/blobs", []byte("ciphertext"), group, "")
+	req := signedRequest(t, http.MethodPost, "/api/v1/groups/"+group.id+"/blobs", []byte("plaintext"), group, "")
 	req.Header.Set("Content-Type", "application/octet-stream")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -152,14 +152,14 @@ func TestBlobRoundTrip(t *testing.T) {
 	if !clipIDPattern.MatchString(created.ClipID) {
 		t.Fatalf("invalid clip id: %s", created.ClipID)
 	}
-	if created.Size != len("ciphertext") || created.Hash != hash([]byte("ciphertext")) {
+	if created.Size != len("plaintext") || created.Hash != hash([]byte("plaintext")) {
 		t.Fatalf("blob metadata size=%d hash=%s", created.Size, created.Hash)
 	}
 
 	get := signedRequest(t, http.MethodGet, "/api/v1/groups/"+group.id+"/blobs/"+created.ClipID, nil, group, "")
 	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, get)
-	if rec.Code != http.StatusOK || rec.Body.String() != "ciphertext" {
+	if rec.Code != http.StatusOK || rec.Body.String() != "plaintext" {
 		t.Fatalf("download status=%d body=%q", rec.Code, rec.Body.String())
 	}
 }

@@ -40,11 +40,9 @@ import {
 import {
   bytesToArrayBuffer,
   bytesToBase64Url,
-  decryptBytes,
-  decryptIndex,
+  decodeIndex,
+  encodeIndex,
   emptyIndex,
-  encryptBytes,
-  encryptIndex,
   mergeIndexes,
   webCryptoUnavailableReason
 } from './crypto';
@@ -66,7 +64,7 @@ import type { ActiveGroup, ClipEntry, ClipIndex, IndexEvent, SavedGroup } from '
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 const retentionMs = 30 * 24 * 60 * 60 * 1000;
-const maxClientPlainBytes = 50 * 1024 * 1024 - 64;
+const maxClientBlobBytes = 50 * 1024 * 1024;
 const legacyDedupeMaxBytes = 2 * 1024 * 1024;
 const legacyDedupeMaxCandidates = 20;
 const cryptoUnavailable = webCryptoUnavailableReason();
@@ -499,10 +497,10 @@ export default function App() {
         }
         return false;
       }
-      const decrypted = await decryptIndex(group.vaultCryptoKey, response.blob);
+      const remoteIndex = decodeIndex(response.blob);
       setBaseHash(response.hash);
-      setIndex(decrypted);
-      await cleanupExpired(decrypted, group, response.hash);
+      setIndex(remoteIndex);
+      await cleanupExpired(remoteIndex, group, response.hash);
       return true;
     } catch (err) {
       handleRemoteFatalError(err, group);
@@ -608,9 +606,9 @@ export default function App() {
     if (!group) {
       throw new Error('请先打开一个剪贴板');
     }
-    const encrypted = await encryptIndex(group.vaultCryptoKey, next);
+    const encoded = encodeIndex(next);
     try {
-      const saved = await saveIndex(group, hash, encrypted);
+      const saved = await saveIndex(group, hash, encoded);
       setIndex(next);
       setBaseHash(saved.hash);
       return;
@@ -623,9 +621,9 @@ export default function App() {
 
     try {
       const remote = await fetchIndex(group);
-      const remoteIndex = await decryptIndex(group.vaultCryptoKey, remote.blob);
+      const remoteIndex = decodeIndex(remote.blob);
       const merged = mergeIndexes(remoteIndex, next);
-      const mergedBlob = await encryptIndex(group.vaultCryptoKey, merged);
+      const mergedBlob = encodeIndex(merged);
       const saved = await saveIndex(group, remote.hash, mergedBlob);
       setIndex(merged);
       setBaseHash(saved.hash);
@@ -655,8 +653,8 @@ export default function App() {
 
   async function addFile(file: File) {
     await run(async () => {
-      if (file.size > maxClientPlainBytes) {
-        throw new Error(`单条内容不能超过 ${formatSize(maxClientPlainBytes)}，请拆成更小的内容后再保存。`);
+      if (file.size > maxClientBlobBytes) {
+        throw new Error(`单条内容不能超过 ${formatSize(maxClientBlobBytes)}，请拆成更小的内容后再保存。`);
       }
       let bytes: Uint8Array;
       try {
@@ -681,16 +679,15 @@ export default function App() {
 
   async function saveOrPromoteClip(input: PlainClipInput): Promise<SaveOutcome> {
     const group = requireGroup();
-    if (input.bytes.byteLength > maxClientPlainBytes) {
-      throw new Error(`单条内容不能超过 ${formatSize(maxClientPlainBytes)}，请拆成更小的内容后再保存。`);
+    if (input.bytes.byteLength > maxClientBlobBytes) {
+      throw new Error(`单条内容不能超过 ${formatSize(maxClientBlobBytes)}，请拆成更小的内容后再保存。`);
     }
     const contentHash = input.contentHash || (await sha256Base64Url(input.bytes));
     const duplicate = await findDuplicateClip(input, contentHash);
     if (duplicate) {
       return promoteDuplicateClip(duplicate, contentHash, group);
     }
-    const encrypted = await encryptBytes(group.vaultCryptoKey, input.bytes);
-    const uploaded = await guardRemoteOperation(group, () => uploadBlob(group, encrypted));
+    const uploaded = await guardRemoteOperation(group, () => uploadBlob(group, input.bytes));
     const now = Date.now();
     const clip: ClipEntry = {
       id: uploaded.clipId,
@@ -700,7 +697,6 @@ export default function App() {
       mime: input.mime,
       preview: input.preview,
       size: input.bytes.byteLength,
-      encryptedSize: encrypted.byteLength,
       contentHash,
       createdAt: now,
       updatedAt: now,
@@ -1296,7 +1292,7 @@ export default function App() {
     }
     await run(async () => {
       await ensurePreviewUrl(clip);
-    }, '已解密预览');
+    }, '已打开预览');
   }
 
   async function openPreviewModal(clip: ClipEntry) {
@@ -1306,7 +1302,7 @@ export default function App() {
     await run(async () => {
       await ensurePreviewUrl(clip);
       setPreviewModalClipId(clip.id);
-    }, previewUrls()[clip.id] ? '已打开大图' : '已解密预览');
+    }, previewUrls()[clip.id] ? '已打开大图' : '已打开预览');
   }
 
   async function ensurePreviewUrl(clip: ClipEntry): Promise<string> {
@@ -1341,7 +1337,7 @@ export default function App() {
 
   async function plainBytes(clip: ClipEntry): Promise<Uint8Array> {
     const group = requireGroup();
-    return decryptBytes(group.vaultCryptoKey, await guardRemoteOperation(group, () => downloadBlob(group, clip.blobId)));
+    return guardRemoteOperation(group, () => downloadBlob(group, clip.blobId));
   }
 
   async function removeClip(clip: ClipEntry) {
@@ -2104,10 +2100,10 @@ function displayError(err: unknown) {
     return '浏览器拒绝本次剪贴板操作。请确认页面在前台，并允许此站点读写剪贴板。';
   }
   if (err instanceof DOMException && err.name === 'OperationError') {
-    return '操作失败：浏览器加密、签名或文件读取没有返回具体原因。请确认剪贴板密钥匹配，并把过大的内容拆小后重试。';
+    return '操作失败：浏览器签名或文件读取没有返回具体原因。请确认剪贴板密钥匹配，并把过大的内容拆小后重试。';
   }
   if (/operation failed for an operation-specific reason/i.test(message)) {
-    return '操作失败：浏览器加密、签名或文件读取没有返回具体原因。请确认剪贴板密钥匹配，并把过大的内容拆小后重试。';
+    return '操作失败：浏览器签名或文件读取没有返回具体原因。请确认剪贴板密钥匹配，并把过大的内容拆小后重试。';
   }
   return message;
 }

@@ -1,11 +1,11 @@
 # OpenList Clipboard
 
-基于 OpenList 存储的端到端加密在线剪贴板。一个剪贴板密钥对应一个剪贴板，服务端只保存剪贴板名称、密钥校验哈希和签名公钥，并代理 OpenList 存取密文。
+基于 OpenList 存储的在线剪贴板。一个剪贴板密钥对应一个剪贴板，服务端保存剪贴板名称、密钥校验哈希和签名公钥，并代理 OpenList 存取明文索引和明文内容。
 
 ## 功能
 
 - 多剪贴板隔离：每个剪贴板有独立剪贴板密钥、签名身份、索引和 blob 路径。
-- AES-GCM 客户端加密，OpenList 和网关不接触明文。
+- 明文存储索引和内容，便于直接在 OpenList 中查看和取回数据。
 - 创建剪贴板需要 `CLIPBOARD_CREATE_PASSWORD`；加入剪贴板只需要 `olckey1...` 剪贴板密钥。
 - 页面内容实时更新：同一后端实例下的同剪贴板设备写入后，其他已打开页面通过 SSE 刷新列表，不使用轮询。
 - 可选前台剪贴板同步：页面在前台时可在窗口聚焦、重新可见、收到实时更新或浏览器支持的剪贴板变化事件后同步系统剪贴板。
@@ -94,10 +94,10 @@ CLIPBOARD_TRUST_PROXY_HEADERS=true
 
 ## 存储布局
 
-- 新 V1 路径：`/clipboard/v1/groups/{groupId}/group.json`、`index.enc`、`blobs/YYYY-MM/{clipId}.bin`。
+- 新 V1 路径：`/clipboard/v1/groups/{groupId}/group.json`、`index.enc`、`blobs/YYYY-MM/{clipId}.bin`。本分支沿用 `index.enc` 文件名，但文件内容是明文 JSON。
 
 ## 安全边界
 
-- 服务端只接收密文 blob、随机 ID、大小、hash 和组公钥。
-- 原始文件名、文本内容、MIME 类型、过期时间都只存在于加密索引里。
+- 服务端和 OpenList 可以看到明文 blob、文件名、文本预览、MIME 类型和过期时间。
+- 剪贴板密钥仍用于派生剪贴板 ID、校验哈希和请求签名身份；它控制加入和写入权限，但不再用于加密内容。
 - 过期清理由已解锁的前端执行；服务端负责限制大小、路径、签名和请求频率。

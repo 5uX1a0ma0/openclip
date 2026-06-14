@@ -233,7 +233,7 @@ func (a *API) putIndex(w http.ResponseWriter, r *http.Request, groupID string) {
 	}
 	data, err := base64.StdEncoding.DecodeString(req.Blob)
 	if err != nil || len(data) == 0 {
-		writeError(w, http.StatusBadRequest, "invalid encrypted index")
+		writeError(w, http.StatusBadRequest, "invalid index")
 		return
 	}
 	if int64(len(data)) > a.cfg.MaxBlobBytes {

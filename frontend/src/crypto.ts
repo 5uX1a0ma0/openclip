@@ -1,6 +1,5 @@
 import type { ClipIndex } from './types';
 
-const magic = new Uint8Array([0x4f, 0x4c, 0x43, 0x31]);
 const groupIdDomain = 'openlist-clipboard-group-v1';
 const keyHashDomain = 'openlist-clipboard-key-check-v1';
 const signingKeyDomain = 'openlist-clipboard-signing-v1';
@@ -43,14 +42,6 @@ export function generateVaultKey(): string {
   const raw = new Uint8Array(32);
   crypto.getRandomValues(raw);
   return bytesToBase64Url(raw);
-}
-
-export async function importVaultKey(encoded: string): Promise<CryptoKey> {
-  const raw = vaultKeyBytes(encoded);
-  if (raw.byteLength !== 32) {
-    throw new Error('剪贴板密钥必须是 32 字节');
-  }
-  return requireSubtleCrypto().importKey('raw', bytesToArrayBuffer(raw), 'AES-GCM', false, ['encrypt', 'decrypt']);
 }
 
 export function vaultKeyBytes(encoded: string): Uint8Array {
@@ -125,64 +116,22 @@ async function importSigningKey(scalar: bigint, publicKeyJwk: JsonWebKey): Promi
   );
 }
 
-export async function encryptBytes(key: CryptoKey, plaintext: Uint8Array): Promise<Uint8Array> {
-  const crypto = requireWebCrypto();
-  const nonce = new Uint8Array(12);
-  crypto.getRandomValues(nonce);
-  let encrypted: Uint8Array;
-  try {
-    encrypted = new Uint8Array(
-      await requireSubtleCrypto().encrypt(
-        { name: 'AES-GCM', iv: bytesToArrayBuffer(nonce) },
-        key,
-        bytesToArrayBuffer(plaintext)
-      )
-    );
-  } catch (err) {
-    throw new Error(`加密失败：内容可能过大，或当前浏览器无法完成本次加密。${errorDetail(err)}`);
-  }
-  const out = new Uint8Array(magic.length + nonce.length + encrypted.length);
-  out.set(magic, 0);
-  out.set(nonce, magic.length);
-  out.set(encrypted, magic.length + nonce.length);
-  return out;
-}
-
-export async function decryptBytes(key: CryptoKey, envelope: Uint8Array): Promise<Uint8Array> {
-  if (envelope.length <= magic.length + 12) {
-    throw new Error('密文长度过短');
-  }
-  for (let i = 0; i < magic.length; i += 1) {
-    if (envelope[i] !== magic[i]) {
-      throw new Error('不支持的密文格式');
-    }
-  }
-  const nonce = envelope.slice(magic.length, magic.length + 12);
-  const ciphertext = envelope.slice(magic.length + 12);
-  try {
-    return new Uint8Array(
-      await requireSubtleCrypto().decrypt(
-        { name: 'AES-GCM', iv: bytesToArrayBuffer(nonce) },
-        key,
-        bytesToArrayBuffer(ciphertext)
-      )
-    );
-  } catch (err) {
-    throw new Error(`解密失败：剪贴板密钥与当前数据不匹配，或远端数据已损坏。${errorDetail(err)}`);
-  }
-}
-
-export async function encryptIndex(key: CryptoKey, index: ClipIndex): Promise<string> {
+export function encodeIndex(index: ClipIndex): string {
   const raw = new TextEncoder().encode(JSON.stringify(index));
-  return bytesToBase64(await encryptBytes(key, raw));
+  return bytesToBase64(raw);
 }
 
-export async function decryptIndex(key: CryptoKey, blob: string): Promise<ClipIndex> {
+export function decodeIndex(blob: string): ClipIndex {
   if (!blob) {
     return emptyIndex();
   }
-  const raw = await decryptBytes(key, base64ToBytes(blob));
-  const parsed = JSON.parse(new TextDecoder().decode(raw)) as ClipIndex;
+  let parsed: Partial<ClipIndex>;
+  try {
+    const raw = base64ToBytes(blob);
+    parsed = JSON.parse(new TextDecoder().decode(raw)) as Partial<ClipIndex>;
+  } catch {
+    throw new Error('索引格式无效：远端数据不是明文 JSON。');
+  }
   return {
     version: 1,
     updatedAt: parsed.updatedAt || Date.now(),
@@ -352,12 +301,4 @@ function bigIntToBytes(value: bigint): Uint8Array {
     current >>= 8n;
   }
   return out;
-}
-
-function errorDetail(err: unknown) {
-  const message = err instanceof Error ? err.message : String(err);
-  if (!message || /operation failed for an operation-specific reason/i.test(message)) {
-    return '';
-  }
-  return `(${message})`;
 }
