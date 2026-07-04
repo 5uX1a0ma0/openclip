@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -15,6 +16,17 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "--generate-vapid" {
+		publicKey, privateKey, err := server.GenerateVAPIDKeys()
+		if err != nil {
+			log.Fatalf("generate vapid: %v", err)
+		}
+		fmt.Printf("CLIPBOARD_VAPID_PUBLIC_KEY=%s\n", publicKey)
+		fmt.Printf("CLIPBOARD_VAPID_PRIVATE_KEY=%s\n", privateKey)
+		fmt.Println("CLIPBOARD_VAPID_SUBJECT=mailto:admin@example.com")
+		return
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("config: %v", err)
@@ -44,6 +56,9 @@ func main() {
 		MaxBlobBytes:      cfg.MaxBlobBytes,
 		TrustProxyHeaders: cfg.TrustProxyHeaders,
 		StaticDir:         cfg.StaticDir,
+		VAPIDPublicKey:    cfg.VAPIDPublicKey,
+		VAPIDPrivateKey:   cfg.VAPIDPrivateKey,
+		VAPIDSubject:      cfg.VAPIDSubject,
 	}, store)
 
 	srv := &http.Server{

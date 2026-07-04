@@ -126,6 +126,14 @@ async function importSigningKey(scalar: bigint, publicKeyJwk: JsonWebKey): Promi
 }
 
 export async function encryptBytes(key: CryptoKey, plaintext: Uint8Array): Promise<Uint8Array> {
+  return encryptEnvelope(key, plaintext);
+}
+
+export async function encryptChunkBytes(key: CryptoKey, plaintext: Uint8Array, aad: Uint8Array): Promise<Uint8Array> {
+  return encryptEnvelope(key, plaintext, aad);
+}
+
+async function encryptEnvelope(key: CryptoKey, plaintext: Uint8Array, aad?: Uint8Array): Promise<Uint8Array> {
   const crypto = requireWebCrypto();
   const nonce = new Uint8Array(12);
   crypto.getRandomValues(nonce);
@@ -133,7 +141,7 @@ export async function encryptBytes(key: CryptoKey, plaintext: Uint8Array): Promi
   try {
     encrypted = new Uint8Array(
       await requireSubtleCrypto().encrypt(
-        { name: 'AES-GCM', iv: bytesToArrayBuffer(nonce) },
+        aesGCMParams(nonce, aad),
         key,
         bytesToArrayBuffer(plaintext)
       )
@@ -149,6 +157,14 @@ export async function encryptBytes(key: CryptoKey, plaintext: Uint8Array): Promi
 }
 
 export async function decryptBytes(key: CryptoKey, envelope: Uint8Array): Promise<Uint8Array> {
+  return decryptEnvelope(key, envelope);
+}
+
+export async function decryptChunkBytes(key: CryptoKey, envelope: Uint8Array, aad: Uint8Array): Promise<Uint8Array> {
+  return decryptEnvelope(key, envelope, aad);
+}
+
+async function decryptEnvelope(key: CryptoKey, envelope: Uint8Array, aad?: Uint8Array): Promise<Uint8Array> {
   if (envelope.length <= magic.length + 12) {
     throw new Error('密文长度过短');
   }
@@ -162,7 +178,7 @@ export async function decryptBytes(key: CryptoKey, envelope: Uint8Array): Promis
   try {
     return new Uint8Array(
       await requireSubtleCrypto().decrypt(
-        { name: 'AES-GCM', iv: bytesToArrayBuffer(nonce) },
+        aesGCMParams(nonce, aad),
         key,
         bytesToArrayBuffer(ciphertext)
       )
@@ -170,6 +186,14 @@ export async function decryptBytes(key: CryptoKey, envelope: Uint8Array): Promis
   } catch (err) {
     throw new Error(`解密失败：剪贴板密钥与当前数据不匹配，或远端数据已损坏。${errorDetail(err)}`);
   }
+}
+
+function aesGCMParams(nonce: Uint8Array, aad?: Uint8Array): AesGcmParams {
+  const params: AesGcmParams = { name: 'AES-GCM', iv: bytesToArrayBuffer(nonce) };
+  if (aad) {
+    params.additionalData = bytesToArrayBuffer(aad);
+  }
+  return params;
 }
 
 export async function encryptIndex(key: CryptoKey, index: ClipIndex): Promise<string> {

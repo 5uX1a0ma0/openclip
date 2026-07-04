@@ -15,6 +15,9 @@ type Config struct {
 	MaxBlobBytes      int64
 	TrustProxyHeaders bool
 	StaticDir         string
+	VAPIDPublicKey    string
+	VAPIDPrivateKey   string
+	VAPIDSubject      string
 	OpenListBaseURL   string
 	OpenListUsername  string
 	OpenListPassword  string
@@ -35,6 +38,9 @@ func Load() (Config, error) {
 		MaxBlobBytes:      envInt64("CLIPBOARD_MAX_BLOB_BYTES", 50*1024*1024),
 		TrustProxyHeaders: envBool("CLIPBOARD_TRUST_PROXY_HEADERS", false),
 		StaticDir:         env("CLIPBOARD_STATIC_DIR", "frontend/dist"),
+		VAPIDPublicKey:    os.Getenv("CLIPBOARD_VAPID_PUBLIC_KEY"),
+		VAPIDPrivateKey:   os.Getenv("CLIPBOARD_VAPID_PRIVATE_KEY"),
+		VAPIDSubject:      os.Getenv("CLIPBOARD_VAPID_SUBJECT"),
 		OpenListBaseURL:   strings.TrimRight(os.Getenv("OPENLIST_BASE_URL"), "/"),
 		OpenListUsername:  os.Getenv("OPENLIST_USERNAME"),
 		OpenListPassword:  os.Getenv("OPENLIST_PASSWORD"),
@@ -63,6 +69,17 @@ func Load() (Config, error) {
 	}
 	if cfg.MaxBlobBytes <= 0 {
 		return Config{}, errors.New("CLIPBOARD_MAX_BLOB_BYTES must be positive")
+	}
+	if cfg.VAPIDPublicKey != "" || cfg.VAPIDPrivateKey != "" || cfg.VAPIDSubject != "" {
+		if cfg.VAPIDPublicKey == "" {
+			return Config{}, errors.New("CLIPBOARD_VAPID_PUBLIC_KEY is required when Web Push is configured")
+		}
+		if cfg.VAPIDPrivateKey == "" {
+			return Config{}, errors.New("CLIPBOARD_VAPID_PRIVATE_KEY is required when Web Push is configured")
+		}
+		if cfg.VAPIDSubject == "" {
+			return Config{}, errors.New("CLIPBOARD_VAPID_SUBJECT is required when Web Push is configured")
+		}
 	}
 
 	return cfg, nil

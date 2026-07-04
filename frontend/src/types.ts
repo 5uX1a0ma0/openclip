@@ -1,4 +1,11 @@
 export type ClipKind = 'text' | 'image' | 'file';
+export type ClipEncryption = 'aes-gcm-v1' | 'aes-gcm-chunked-v1';
+
+export type ClipChunk = {
+  blobId: string;
+  size: number;
+  encryptedSize: number;
+};
 
 export type ClipEntry = {
   id: string;
@@ -9,6 +16,10 @@ export type ClipEntry = {
   preview: string;
   size: number;
   encryptedSize: number;
+  encryption?: ClipEncryption;
+  chunkSetId?: string;
+  chunkSize?: number;
+  chunks?: ClipChunk[];
   contentHash?: string;
   createdAt: number;
   updatedAt: number;
@@ -42,6 +53,13 @@ export type BlobResponse = {
   clipId: string;
   size: number;
   hash: string;
+};
+
+export type RuntimeConfig = {
+  chunkPlainBytes: number;
+  maxBlobBytes?: number;
+  webPushEnabled: boolean;
+  vapidPublicKey: string;
 };
 
 export type SavedGroup = {

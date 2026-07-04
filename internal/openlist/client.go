@@ -108,6 +108,46 @@ func (c *Client) WriteGroup(ctx context.Context, group storage.Group) error {
 	return c.putFile(ctx, groupPath, bytes.NewReader(raw), int64(len(raw)))
 }
 
+func (c *Client) ReadPushSubscriptions(ctx context.Context, groupID string) ([]storage.PushSubscription, error) {
+	subscriptionsPath, err := c.pushSubscriptionsPath(groupID)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := c.readFile(ctx, subscriptionsPath, 1<<20)
+	if err != nil {
+		return nil, err
+	}
+	var file struct {
+		Version       int                        `json:"version"`
+		Subscriptions []storage.PushSubscription `json:"subscriptions"`
+	}
+	if err := json.Unmarshal(raw, &file); err != nil {
+		return nil, err
+	}
+	return file.Subscriptions, nil
+}
+
+func (c *Client) WritePushSubscriptions(ctx context.Context, groupID string, subscriptions []storage.PushSubscription) error {
+	subscriptionsPath, err := c.pushSubscriptionsPath(groupID)
+	if err != nil {
+		return err
+	}
+	if err := c.mkdir(ctx, path.Dir(subscriptionsPath)); err != nil {
+		return err
+	}
+	raw, err := json.Marshal(struct {
+		Version       int                        `json:"version"`
+		Subscriptions []storage.PushSubscription `json:"subscriptions"`
+	}{
+		Version:       1,
+		Subscriptions: subscriptions,
+	})
+	if err != nil {
+		return err
+	}
+	return c.putFile(ctx, subscriptionsPath, bytes.NewReader(raw), int64(len(raw)))
+}
+
 func (c *Client) ReadIndex(ctx context.Context, groupID string) ([]byte, error) {
 	indexPath, err := c.indexPath(groupID)
 	if err != nil {
@@ -207,6 +247,14 @@ func (c *Client) indexPath(groupID string) (string, error) {
 		return "", err
 	}
 	return joinPath(groupPath, "index.enc"), nil
+}
+
+func (c *Client) pushSubscriptionsPath(groupID string) (string, error) {
+	groupPath, err := c.groupPath(groupID)
+	if err != nil {
+		return "", err
+	}
+	return joinPath(groupPath, "push-subscriptions.json"), nil
 }
 
 func (c *Client) blobPath(groupID string, clipID string) (string, error) {

@@ -1,4 +1,4 @@
-import type { BlobResponse, GroupAuth, GroupMetadata, IndexEvent, IndexResponse } from './types';
+import type { BlobResponse, GroupAuth, GroupMetadata, IndexEvent, IndexResponse, RuntimeConfig } from './types';
 import { bytesToArrayBuffer, bytesToBase64Url } from './crypto';
 
 const textEncoder = new TextEncoder();
@@ -58,12 +58,16 @@ export async function joinRemoteGroup(groupId: string, keyHash: string, publicKe
   });
 }
 
+export async function fetchRuntimeConfig(): Promise<RuntimeConfig> {
+  return apiFetch<RuntimeConfig>('/api/v1/runtime-config');
+}
+
 export async function fetchIndex(auth: GroupAuth): Promise<IndexResponse> {
   return signedJSON(auth, `/api/v1/groups/${encodeURIComponent(auth.id)}/index`, 'GET');
 }
 
-export async function saveIndex(auth: GroupAuth, baseHash: string, blob: string): Promise<{ hash: string }> {
-  return signedJSON(auth, `/api/v1/groups/${encodeURIComponent(auth.id)}/index`, 'PUT', { baseHash, blob });
+export async function saveIndex(auth: GroupAuth, baseHash: string, blob: string, clientId = ''): Promise<{ hash: string }> {
+  return signedJSON(auth, `/api/v1/groups/${encodeURIComponent(auth.id)}/index`, 'PUT', { baseHash, blob, clientId });
 }
 
 export async function uploadBlob(auth: GroupAuth, blob: Uint8Array): Promise<BlobResponse> {
@@ -85,6 +89,25 @@ export async function downloadBlob(auth: GroupAuth, clipId: string): Promise<Uin
 export async function deleteBlob(auth: GroupAuth, clipId: string): Promise<void> {
   await signedFetch(auth, `/api/v1/groups/${encodeURIComponent(auth.id)}/blobs/${encodeURIComponent(clipId)}`, {
     method: 'DELETE'
+  });
+}
+
+export async function savePushSubscription(
+  auth: GroupAuth,
+  clientId: string,
+  subscription: PushSubscriptionJSON
+): Promise<void> {
+  await signedJSON(auth, `/api/v1/groups/${encodeURIComponent(auth.id)}/push-subscriptions`, 'POST', {
+    clientId,
+    endpoint: subscription.endpoint,
+    keys: subscription.keys
+  });
+}
+
+export async function deletePushSubscription(auth: GroupAuth, clientId: string, endpoint: string): Promise<void> {
+  await signedJSON(auth, `/api/v1/groups/${encodeURIComponent(auth.id)}/push-subscriptions`, 'DELETE', {
+    clientId,
+    endpoint
   });
 }
 

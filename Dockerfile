@@ -12,7 +12,7 @@ RUN npm run build
 FROM golang:1.26-alpine3.23 AS backend-builder
 WORKDIR /src
 
-COPY go.mod ./
+COPY go.mod go.sum ./
 COPY cmd/ ./cmd/
 COPY internal/ ./internal/
 

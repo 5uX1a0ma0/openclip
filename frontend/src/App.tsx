@@ -31,18 +31,30 @@ import {
   downloadBlob,
   fetchIndex,
   isFatalAuthOrGroupError,
+  deletePushSubscription,
+  fetchRuntimeConfig,
   joinRemoteGroup,
   openIndexEvents,
   remoteClipboardUnavailableMessage,
   saveIndex,
+  savePushSubscription,
   uploadBlob
 } from './api';
 import {
+  type CachedEncryptedChunk,
+  encryptedCacheKey,
+  readEncryptedClipCache,
+  writeEncryptedClipCache
+} from './blob_cache';
+import {
+  base64UrlToBytes,
   bytesToArrayBuffer,
   bytesToBase64Url,
+  decryptChunkBytes,
   decryptBytes,
   decryptIndex,
   emptyIndex,
+  encryptChunkBytes,
   encryptBytes,
   encryptIndex,
   mergeIndexes,
@@ -61,21 +73,28 @@ import {
   upsertGroup
 } from './groups';
 import { decodeQRCodeFromCanvas, qrCodeDataURL } from './qr';
-import type { ActiveGroup, ClipEntry, ClipIndex, IndexEvent, SavedGroup } from './types';
+import { createSHA256 } from 'hash-wasm';
+import type { ActiveGroup, ClipChunk, ClipEntry, ClipIndex, IndexEvent, RuntimeConfig, SavedGroup } from './types';
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 const retentionMs = 30 * 24 * 60 * 60 * 1000;
-const maxClientPlainBytes = 50 * 1024 * 1024 - 64;
+const maxClientPlainBytes = 512 * 1024 * 1024;
+const defaultMaxBlobBytes = 50 * 1024 * 1024;
 const legacyDedupeMaxBytes = 2 * 1024 * 1024;
 const legacyDedupeMaxCandidates = 20;
+const defaultChunkPlainBytes = 4 * 1024 * 1024;
+const chunkedEncryption = 'aes-gcm-chunked-v1';
 const cryptoUnavailable = webCryptoUnavailableReason();
 const notificationEnabledStorageKey = 'openlist-clipboard.notify.enabled.v1';
 const syncEnabledStorageKey = 'openlist-clipboard.sync.enabled.v1';
 const syncStateStorageKey = 'openlist-clipboard.sync.state.v1';
+const clientIdStorageKey = 'openlist-clipboard.client-id.v1';
 const scannerMaxEdge = 640;
 const scannerScanIntervalMs = 120;
 const maxToastCount = 3;
+const maxPlainCacheEntries = 8;
+const maxPlainCacheBytes = 8 * 1024 * 1024;
 const notificationTitle = 'OpenList Clipboard';
 const updateNotificationBody = '剪贴板内容已更新';
 
@@ -101,8 +120,13 @@ type ClipboardSnapshot = {
   preview: string;
   hash: string;
 };
+type PlainSource = {
+  bytes?: Uint8Array;
+  file?: File;
+};
 type PlainClipInput = {
-  bytes: Uint8Array;
+  source: PlainSource;
+  size: number;
   kind: ClipEntry['kind'];
   name: string;
   mime: string;
@@ -114,6 +138,15 @@ type SaveOutcome = {
   contentHash: string;
   mode: 'created' | 'promoted' | 'unchanged';
 };
+type UploadedEncryptedInput = {
+  id: string;
+  blobId: string;
+  encryptedSize: number;
+  encryption?: ClipEntry['encryption'];
+  chunkSetId?: string;
+  chunkSize?: number;
+  chunks?: ClipChunk[];
+};
 type StoredSyncState = {
   localHash?: string;
   localObservedAt?: number;
@@ -121,6 +154,13 @@ type StoredSyncState = {
   remoteHash?: string;
   remoteCopiedAt?: number;
 };
+type ExpandedTextState = {
+  loading?: boolean;
+  text?: string;
+  error?: string;
+};
+
+const clientId = loadClientId();
 
 export default function App() {
   const [groups, setGroups] = createSignal<SavedGroup[]>([]);
@@ -136,7 +176,14 @@ export default function App() {
   const [operationLabel, setOperationLabel] = createSignal('');
   const [persistentNotice, setPersistentNotice] = createSignal<PersistentNotice | null>(null);
   const [toasts, setToasts] = createSignal<ToastMessage[]>([]);
+  const [runtimeConfig, setRuntimeConfig] = createSignal<RuntimeConfig>({
+    chunkPlainBytes: defaultChunkPlainBytes,
+    maxBlobBytes: defaultMaxBlobBytes,
+    webPushEnabled: false,
+    vapidPublicKey: ''
+  });
   const [previewUrls, setPreviewUrls] = createSignal<Record<string, string>>({});
+  const [expandedText, setExpandedText] = createSignal<Record<string, ExpandedTextState>>({});
   const [previewModalClipId, setPreviewModalClipId] = createSignal('');
   const [inviteQR, setInviteQR] = createSignal('');
   const [showInviteQR, setShowInviteQR] = createSignal(false);
@@ -165,6 +212,7 @@ export default function App() {
   let lastNotifiedIndexHash = '';
   let toastID = 0;
   const toastTimers = new Map<number, number>();
+  const plainCache = new Map<string, Uint8Array>();
 
   const unlocked = createMemo(() => activeGroup() !== null);
   const activeClips = createMemo(() =>
@@ -197,7 +245,7 @@ export default function App() {
     }
     const permission = notificationPermission();
     if (permission === 'granted') {
-      return '远端更新通知：系统通知';
+      return runtimeConfig().webPushEnabled ? '远端更新通知：后台推送' : '远端更新通知：系统通知';
     }
     if (permission === 'denied') {
       return '远端更新通知：系统通知已被拒绝，将使用页内提示';
@@ -209,6 +257,8 @@ export default function App() {
   });
 
   onMount(async () => {
+    void loadRuntimeConfig();
+    void registerServiceWorker();
     window.addEventListener('paste', handlePaste);
     window.addEventListener('dragover', preventDefault);
     window.addEventListener('drop', handleDrop);
@@ -237,6 +287,14 @@ export default function App() {
     connectIndexEvents(group);
   });
 
+  createEffect(() => {
+    const group = activeGroup();
+    const config = runtimeConfig();
+    if (group && clipboardNotifyEnabled() && config.webPushEnabled && notificationPermissionState() === 'granted') {
+      void ensurePushSubscription(group);
+    }
+  });
+
   onCleanup(() => {
     window.removeEventListener('paste', handlePaste);
     window.removeEventListener('dragover', preventDefault);
@@ -249,10 +307,37 @@ export default function App() {
     closeIndexEvents();
     closeUpdateNotification();
     stopInviteScanner();
+    plainCache.clear();
     Object.values(previewUrls()).forEach(URL.revokeObjectURL);
     toastTimers.forEach((timer) => window.clearTimeout(timer));
     toastTimers.clear();
   });
+
+  async function loadRuntimeConfig() {
+    try {
+      const config = await fetchRuntimeConfig();
+      const maxBlobBytes = config.maxBlobBytes;
+      setRuntimeConfig({
+        chunkPlainBytes: Number.isFinite(config.chunkPlainBytes) && config.chunkPlainBytes > 0 ? config.chunkPlainBytes : defaultChunkPlainBytes,
+        maxBlobBytes: typeof maxBlobBytes === 'number' && Number.isFinite(maxBlobBytes) && maxBlobBytes > 0 ? maxBlobBytes : defaultMaxBlobBytes,
+        webPushEnabled: config.webPushEnabled === true,
+        vapidPublicKey: config.vapidPublicKey || ''
+      });
+    } catch {
+      setRuntimeConfig({ chunkPlainBytes: defaultChunkPlainBytes, maxBlobBytes: defaultMaxBlobBytes, webPushEnabled: false, vapidPublicKey: '' });
+    }
+  }
+
+  async function registerServiceWorker(): Promise<ServiceWorkerRegistration | null> {
+    if (!('serviceWorker' in navigator) || !window.isSecureContext) {
+      return null;
+    }
+    try {
+      return await navigator.serviceWorker.register('/sw.js');
+    } catch {
+      return null;
+    }
+  }
 
   async function createGroupAction(event: Event) {
     event.preventDefault();
@@ -293,6 +378,8 @@ export default function App() {
     const opened = await activateGroup(saved);
     closeIndexEvents();
     clearPreviewUrls();
+    clearExpandedText();
+    plainCache.clear();
     clearQueuedClipboardSync();
     closeUpdateNotification();
     reconnectBlockedGroupID = '';
@@ -306,12 +393,17 @@ export default function App() {
     setIndex(emptyIndex());
     setBaseHash('');
     await loadIndex(opened);
+    if (loadNotificationEnabled(opened.id)) {
+      void ensurePushSubscription(opened);
+    }
     requestClipboardSync('focus');
   }
 
   function leaveGroup() {
     closeIndexEvents();
     clearPreviewUrls();
+    clearExpandedText();
+    plainCache.clear();
     clearQueuedClipboardSync();
     closeUpdateNotification();
     reconnectBlockedGroupID = '';
@@ -610,7 +702,7 @@ export default function App() {
     }
     const encrypted = await encryptIndex(group.vaultCryptoKey, next);
     try {
-      const saved = await saveIndex(group, hash, encrypted);
+      const saved = await saveIndex(group, hash, encrypted, clientId);
       setIndex(next);
       setBaseHash(saved.hash);
       return;
@@ -626,7 +718,7 @@ export default function App() {
       const remoteIndex = await decryptIndex(group.vaultCryptoKey, remote.blob);
       const merged = mergeIndexes(remoteIndex, next);
       const mergedBlob = await encryptIndex(group.vaultCryptoKey, merged);
-      const saved = await saveIndex(group, remote.hash, mergedBlob);
+      const saved = await saveIndex(group, remote.hash, mergedBlob, clientId);
       setIndex(merged);
       setBaseHash(saved.hash);
     } catch (err) {
@@ -641,8 +733,10 @@ export default function App() {
       return;
     }
     await run(async () => {
+      const bytes = textEncoder.encode(value);
       const outcome = await addPlainBytes({
-        bytes: textEncoder.encode(value),
+        source: { bytes },
+        size: bytes.byteLength,
         kind: 'text',
         name: '文本',
         mime: 'text/plain;charset=utf-8',
@@ -658,14 +752,9 @@ export default function App() {
       if (file.size > maxClientPlainBytes) {
         throw new Error(`单条内容不能超过 ${formatSize(maxClientPlainBytes)}，请拆成更小的内容后再保存。`);
       }
-      let bytes: Uint8Array;
-      try {
-        bytes = new Uint8Array(await file.arrayBuffer());
-      } catch {
-        throw new Error(`无法读取文件：${file.name || '未命名文件'}。请确认文件仍在本机且未被占用。`);
-      }
       const outcome = await addPlainBytes({
-        bytes,
+        source: { file },
+        size: file.size,
         kind: file.type.startsWith('image/') ? 'image' : 'file',
         name: file.name || 'clipboard.bin',
         mime: file.type || 'application/octet-stream',
@@ -679,28 +768,119 @@ export default function App() {
     return saveOrPromoteClip(input);
   }
 
+  function normalizedChunkSize() {
+    const configured = runtimeConfig().chunkPlainBytes;
+    if (!Number.isFinite(configured) || configured <= 0) {
+      return defaultChunkPlainBytes;
+    }
+    return Math.max(1, Math.min(Math.floor(configured), maxClientPlainBytes));
+  }
+
+  async function uploadEncryptedInput(group: ActiveGroup, input: PlainClipInput, contentHash: string): Promise<UploadedEncryptedInput> {
+    const chunkSize = normalizedChunkSize();
+    if (input.size <= chunkSize) {
+      const plain = await readPlainInput(input);
+      const encrypted = await encryptBytes(group.vaultCryptoKey, plain);
+      const uploaded = await guardRemoteOperation(group, () => uploadBlob(group, encrypted));
+      rememberPlainBytes(group.id, uploaded.clipId, plain);
+      return {
+        id: uploaded.clipId,
+        blobId: uploaded.clipId,
+        encryptedSize: encrypted.byteLength,
+        encryption: 'aes-gcm-v1'
+      };
+    }
+
+    const cached = await readEncryptedClipCache(encryptedCacheKey(group.id, contentHash, input.size, chunkSize));
+    const chunkSetId = cached?.chunkSetId || randomCacheToken();
+    const encryptedChunks = cached?.chunks || (await encryptInputChunks(group, input, contentHash, chunkSize, chunkSetId));
+    const chunks: ClipChunk[] = [];
+    let encryptedSize = 0;
+    for (const cachedChunk of encryptedChunks) {
+      const uploaded = await guardRemoteOperation(group, () => uploadBlob(group, cachedChunk.encrypted));
+      chunks.push({
+        blobId: uploaded.clipId,
+        size: cachedChunk.plainSize,
+        encryptedSize: cachedChunk.encryptedSize
+      });
+      encryptedSize += cachedChunk.encryptedSize;
+    }
+    const first = chunks[0];
+    if (!first) {
+      throw new Error('分片上传没有生成任何内容。');
+    }
+    if (input.source.bytes) {
+      rememberPlainBytes(group.id, first.blobId, input.source.bytes);
+    }
+    return {
+      id: first.blobId,
+      blobId: first.blobId,
+      encryptedSize,
+      encryption: chunkedEncryption,
+      chunkSetId,
+      chunkSize,
+      chunks
+    };
+  }
+
+  async function encryptInputChunks(
+    group: ActiveGroup,
+    input: PlainClipInput,
+    contentHash: string,
+    chunkSize: number,
+    chunkSetId: string
+  ): Promise<CachedEncryptedChunk[]> {
+    const encryptedChunks: CachedEncryptedChunk[] = [];
+    let index = 0;
+    for (let offset = 0; offset < input.size; offset += chunkSize) {
+      const plain = await readPlainInputChunk(input, offset, Math.min(chunkSize, input.size - offset));
+      const encrypted = await encryptChunkBytes(group.vaultCryptoKey, plain, chunkAAD(chunkSetId, index, plain.byteLength));
+      encryptedChunks.push({
+        index,
+        plainSize: plain.byteLength,
+        encryptedSize: encrypted.byteLength,
+        encrypted
+      });
+      index += 1;
+    }
+    await writeEncryptedClipCache({
+      key: encryptedCacheKey(group.id, contentHash, input.size, chunkSize),
+      groupId: group.id,
+      contentHash,
+      size: input.size,
+      chunkSize,
+      chunkSetId,
+      chunks: encryptedChunks,
+      updatedAt: Date.now()
+    });
+    return encryptedChunks;
+  }
+
   async function saveOrPromoteClip(input: PlainClipInput): Promise<SaveOutcome> {
     const group = requireGroup();
-    if (input.bytes.byteLength > maxClientPlainBytes) {
+    if (input.size > maxClientPlainBytes) {
       throw new Error(`单条内容不能超过 ${formatSize(maxClientPlainBytes)}，请拆成更小的内容后再保存。`);
     }
-    const contentHash = input.contentHash || (await sha256Base64Url(input.bytes));
+    const contentHash = input.contentHash || (await sha256Input(input));
     const duplicate = await findDuplicateClip(input, contentHash);
     if (duplicate) {
       return promoteDuplicateClip(duplicate, contentHash, group);
     }
-    const encrypted = await encryptBytes(group.vaultCryptoKey, input.bytes);
-    const uploaded = await guardRemoteOperation(group, () => uploadBlob(group, encrypted));
+    const saved = await uploadEncryptedInput(group, input, contentHash);
     const now = Date.now();
     const clip: ClipEntry = {
-      id: uploaded.clipId,
-      blobId: uploaded.clipId,
+      id: saved.id,
+      blobId: saved.blobId,
       kind: input.kind,
       name: input.name,
       mime: input.mime,
       preview: input.preview,
-      size: input.bytes.byteLength,
-      encryptedSize: encrypted.byteLength,
+      size: input.size,
+      encryptedSize: saved.encryptedSize,
+      encryption: saved.encryption,
+      chunkSetId: saved.chunkSetId,
+      chunkSize: saved.chunkSize,
+      chunks: saved.chunks,
       contentHash,
       createdAt: now,
       updatedAt: now,
@@ -723,12 +903,12 @@ export default function App() {
       return hashed;
     }
 
-    if (input.bytes.byteLength > legacyDedupeMaxBytes) {
+    if (input.size > legacyDedupeMaxBytes || !input.source.bytes) {
       return null;
     }
 
     const candidates = clips
-      .filter((clip) => !clip.contentHash && clip.kind === input.kind && clip.size === input.bytes.byteLength)
+      .filter((clip) => !clip.contentHash && clip.kind === input.kind && clip.size === input.size)
       .slice(0, legacyDedupeMaxCandidates);
     for (const clip of candidates) {
       try {
@@ -784,7 +964,8 @@ export default function App() {
             const blob = await item.getType(imageType);
             const bytes = new Uint8Array(await blob.arrayBuffer());
             const outcome = await addPlainBytes({
-              bytes,
+              source: { bytes },
+              size: bytes.byteLength,
               kind: 'image',
               name: `clipboard-${Date.now()}.${imageExtension(imageType)}`,
               mime: imageType,
@@ -799,8 +980,10 @@ export default function App() {
       }
       const text = await nav.readText();
       if (text.trim()) {
+        const bytes = textEncoder.encode(text);
         const outcome = await addPlainBytes({
-          bytes: textEncoder.encode(text),
+          source: { bytes },
+          size: bytes.byteLength,
           kind: 'text',
           name: '文本',
           mime: 'text/plain;charset=utf-8',
@@ -865,6 +1048,7 @@ export default function App() {
     saveNotificationEnabled(group.id, enabled);
     if (!enabled) {
       closeUpdateNotification();
+      await removePushSubscription(group);
       showToast('剪贴板更新通知已关闭', 'info');
       return;
     }
@@ -876,7 +1060,8 @@ export default function App() {
       return;
     }
     if (permission === 'granted') {
-      showToast('剪贴板更新通知已开启', 'info');
+      await ensurePushSubscription(group);
+      showToast(runtimeConfig().webPushEnabled ? '后台通知已开启' : '剪贴板更新通知已开启', 'info');
       return;
     }
     if (permission === 'denied') {
@@ -888,6 +1073,61 @@ export default function App() {
       return;
     }
     showToast('未授予系统通知权限，将使用页内提示', 'info');
+  }
+
+  async function ensurePushSubscription(group: ActiveGroup) {
+    const config = runtimeConfig();
+    if (!config.webPushEnabled || !config.vapidPublicKey || notificationPermissionState() !== 'granted') {
+      return;
+    }
+    if (!('PushManager' in window)) {
+      showToast('当前浏览器不支持后台推送，将使用打开页面通知', 'info');
+      return;
+    }
+    const registration = await registerServiceWorker();
+    if (!registration) {
+      showToast('后台通知注册失败，将使用打开页面通知', 'info');
+      return;
+    }
+    const subscription =
+      (await registration.pushManager.getSubscription()) ||
+      (await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: bytesToArrayBuffer(base64UrlToBytes(config.vapidPublicKey))
+      }));
+    const json = subscription.toJSON();
+    if (!json.endpoint || !json.keys?.p256dh || !json.keys.auth) {
+      throw new Error('浏览器返回了不完整的推送订阅。');
+    }
+    await guardRemoteOperation(group, () => savePushSubscription(group, clientId, json));
+  }
+
+  async function removePushSubscription(group: ActiveGroup) {
+    if (!('serviceWorker' in navigator)) {
+      try {
+        await guardRemoteOperation(group, () => deletePushSubscription(group, clientId, 'client-only'));
+      } catch {
+        // Best-effort cleanup.
+      }
+      return;
+    }
+    const registration = await navigator.serviceWorker.getRegistration();
+    const subscription = await registration?.pushManager.getSubscription();
+    const endpoint = subscription?.endpoint;
+    if (endpoint) {
+      try {
+        await guardRemoteOperation(group, () => deletePushSubscription(group, clientId, endpoint));
+      } catch {
+        // Local opt-out should still proceed if the server is temporarily unavailable.
+      }
+      await subscription.unsubscribe();
+    } else {
+      try {
+        await guardRemoteOperation(group, () => deletePushSubscription(group, clientId, 'client-only'));
+      } catch {
+        // Best-effort cleanup.
+      }
+    }
   }
 
   function notifyRemoteClipboardUpdated(group: ActiveGroup) {
@@ -1102,7 +1342,7 @@ export default function App() {
 
       const localChanged = !!state.localHash && snapshot.hash !== state.localHash;
       if (localChanged) {
-        const duplicate = await findDuplicateClip(snapshot, snapshot.hash);
+        const duplicate = await findDuplicateClip(plainInputFromSnapshot(snapshot), snapshot.hash);
         if (duplicate) {
           const outcome = await promoteDuplicateClip(duplicate, snapshot.hash, group);
           saveSyncState(groupID, {
@@ -1128,14 +1368,7 @@ export default function App() {
     if (!group || group.id !== groupID) {
       return;
     }
-    const outcome = await addPlainBytes({
-      bytes: snapshot.bytes,
-      kind: snapshot.kind,
-      name: snapshot.name,
-      mime: snapshot.mime,
-      preview: snapshot.preview,
-      contentHash: snapshot.hash
-    });
+    const outcome = await addPlainBytes(plainInputFromSnapshot(snapshot));
     const state = loadSyncState(groupID);
     saveSyncState(groupID, {
       ...state,
@@ -1299,6 +1532,24 @@ export default function App() {
     }, '已解密预览');
   }
 
+  async function toggleTextExpansion(clip: ClipEntry) {
+    if (clip.kind !== 'text') {
+      return;
+    }
+    const current = expandedText()[clip.id];
+    if (current?.text || current?.loading || current?.error) {
+      clearExpandedText(clip.id);
+      return;
+    }
+    setExpandedText((items) => ({ ...items, [clip.id]: { loading: true } }));
+    try {
+      const text = textDecoder.decode(await plainBytes(clip));
+      setExpandedText((items) => ({ ...items, [clip.id]: { text } }));
+    } catch (err) {
+      setExpandedText((items) => ({ ...items, [clip.id]: { error: displayError(err) } }));
+    }
+  }
+
   async function openPreviewModal(clip: ClipEntry) {
     if (clip.kind !== 'image') {
       return;
@@ -1341,13 +1592,42 @@ export default function App() {
 
   async function plainBytes(clip: ClipEntry): Promise<Uint8Array> {
     const group = requireGroup();
-    return decryptBytes(group.vaultCryptoKey, await guardRemoteOperation(group, () => downloadBlob(group, clip.blobId)));
+    const cached = recallPlainBytes(group.id, clip);
+    if (cached) {
+      return cached;
+    }
+    let plain: Uint8Array;
+    if (isChunkedClip(clip)) {
+      const chunks: Uint8Array[] = [];
+      let total = 0;
+      for (let index = 0; index < clip.chunks.length; index += 1) {
+        const chunk = clip.chunks[index];
+        const envelope = await guardRemoteOperation(group, () => downloadBlob(group, chunk.blobId));
+        const decrypted = await decryptChunkBytes(group.vaultCryptoKey, envelope, chunkAAD(clip.chunkSetId, index, chunk.size));
+        chunks.push(decrypted);
+        total += decrypted.byteLength;
+      }
+      plain = concatBytes(chunks, total);
+    } else {
+      plain = await decryptBytes(group.vaultCryptoKey, await guardRemoteOperation(group, () => downloadBlob(group, clip.blobId)));
+    }
+    rememberPlainBytes(group.id, clip.id, plain);
+    return plain;
+  }
+
+  async function deleteClipBlobs(group: ActiveGroup, clip: ClipEntry) {
+    const blobIds = isChunkedClip(clip) ? clip.chunks.map((chunk) => chunk.blobId) : [clip.blobId];
+    const results = await Promise.allSettled(blobIds.map((blobId) => guardRemoteOperation(group, () => deleteBlob(group, blobId))));
+    const fatal = results.find((result) => result.status === 'rejected' && isFatalAuthOrGroupError(result.reason));
+    if (fatal?.status === 'rejected') {
+      throw fatal.reason;
+    }
   }
 
   async function removeClip(clip: ClipEntry) {
     await run(async () => {
       const group = requireGroup();
-      await guardRemoteOperation(group, () => deleteBlob(group, clip.blobId));
+      await deleteClipBlobs(group, clip);
       const now = Date.now();
       const next = {
         ...index(),
@@ -1365,6 +1645,8 @@ export default function App() {
         return copy;
       });
       setPreviewModalClipId((current) => (current === clip.id ? '' : current));
+      clearExpandedText(clip.id);
+      forgetPlainBytes(group.id, clip.id);
     }, '已删除');
   }
 
@@ -1396,7 +1678,7 @@ export default function App() {
       setIndex(currentIndex);
       return;
     }
-    const deleteResults = await Promise.allSettled(expired.map((clip) => guardRemoteOperation(group, () => deleteBlob(group, clip.blobId))));
+    const deleteResults = await Promise.allSettled(expired.map((clip) => deleteClipBlobs(group, clip)));
     const fatalDelete = deleteResults.find((result) => result.status === 'rejected' && isFatalAuthOrGroupError(result.reason));
     if (fatalDelete?.status === 'rejected') {
       throw fatalDelete.reason;
@@ -1473,8 +1755,10 @@ export default function App() {
     if (text?.trim()) {
       event.preventDefault();
       void run(async () => {
+        const bytes = textEncoder.encode(text);
         const outcome = await addPlainBytes({
-          bytes: textEncoder.encode(text),
+          source: { bytes },
+          size: bytes.byteLength,
           kind: 'text',
           name: '文本',
           mime: 'text/plain;charset=utf-8',
@@ -1541,6 +1825,52 @@ export default function App() {
     Object.values(previewUrls()).forEach(URL.revokeObjectURL);
     setPreviewUrls({});
     setPreviewModalClipId('');
+  }
+
+  function clearExpandedText(clipId?: string) {
+    if (!clipId) {
+      setExpandedText({});
+      return;
+    }
+    setExpandedText((current) => {
+      if (!current[clipId]) {
+        return current;
+      }
+      const next = { ...current };
+      delete next[clipId];
+      return next;
+    });
+  }
+
+  function rememberPlainBytes(groupID: string, clipID: string, bytes: Uint8Array) {
+    if (bytes.byteLength > maxPlainCacheBytes) {
+      return;
+    }
+    const key = plainCacheKey(groupID, clipID);
+    plainCache.delete(key);
+    plainCache.set(key, bytes);
+    while (plainCache.size > maxPlainCacheEntries) {
+      const oldest = plainCache.keys().next().value;
+      if (!oldest) {
+        break;
+      }
+      plainCache.delete(oldest);
+    }
+  }
+
+  function recallPlainBytes(groupID: string, clip: ClipEntry): Uint8Array | null {
+    const key = plainCacheKey(groupID, clip.id);
+    const cached = plainCache.get(key);
+    if (!cached) {
+      return null;
+    }
+    plainCache.delete(key);
+    plainCache.set(key, cached);
+    return cached;
+  }
+
+  function forgetPlainBytes(groupID: string, clipID: string) {
+    plainCache.delete(plainCacheKey(groupID, clipID));
   }
 
   function canCopyClip(clip: ClipEntry) {
@@ -1729,6 +2059,18 @@ export default function App() {
                     </div>
                     <Show when={clip.kind === 'text'}>
                       <p class="text-preview">{clip.preview || '文本'}</p>
+                      <Show when={expandedText()[clip.id]?.loading}>
+                        <div class="text-expanded-state">
+                          <Loader2 class="spin" size={14} />
+                          解密中
+                        </div>
+                      </Show>
+                      <Show when={expandedText()[clip.id]?.error}>
+                        <div class="text-expanded-state error">{expandedText()[clip.id]?.error}</div>
+                      </Show>
+                      <Show when={expandedText()[clip.id]?.text}>
+                        <pre class="text-expanded">{expandedText()[clip.id]?.text}</pre>
+                      </Show>
                     </Show>
                     <Show when={clip.kind === 'image' && previewUrls()[clip.id]}>
                       <button class="preview-button" type="button" title="查看大图" disabled={busy()} onClick={() => void openPreviewModal(clip)}>
@@ -1758,6 +2100,16 @@ export default function App() {
                           <EyeOff size={17} />
                         </button>
                       </Show>
+                    </Show>
+                    <Show when={clip.kind === 'text'}>
+                      <button
+                        class="icon-button"
+                        title={expandedText()[clip.id] ? '收起全文' : '展开全文'}
+                        disabled={busy()}
+                        onClick={() => void toggleTextExpansion(clip)}
+                      >
+                        <Show when={expandedText()[clip.id]} fallback={<Eye size={17} />}><EyeOff size={17} /></Show>
+                      </button>
                     </Show>
                     <Show when={clip.kind !== 'text'}>
                       <button class="icon-button" title="下载" disabled={busy()} onClick={() => void downloadClip(clip)}>
@@ -1868,6 +2220,122 @@ export default function App() {
       </div>
     </main>
   );
+}
+
+async function readPlainInput(input: PlainClipInput): Promise<Uint8Array> {
+  if (input.source.bytes) {
+    return input.source.bytes;
+  }
+  if (!input.source.file) {
+    throw new Error('没有可读取的内容。');
+  }
+  try {
+    return new Uint8Array(await input.source.file.arrayBuffer());
+  } catch {
+    throw new Error(`无法读取文件：${input.name || '未命名文件'}。请确认文件仍在本机且未被占用。`);
+  }
+}
+
+function plainInputFromSnapshot(snapshot: ClipboardSnapshot): PlainClipInput {
+  return {
+    source: { bytes: snapshot.bytes },
+    size: snapshot.bytes.byteLength,
+    kind: snapshot.kind,
+    name: snapshot.name,
+    mime: snapshot.mime,
+    preview: snapshot.preview,
+    contentHash: snapshot.hash
+  };
+}
+
+async function readPlainInputChunk(input: PlainClipInput, offset: number, size: number): Promise<Uint8Array> {
+  if (input.source.bytes) {
+    return input.source.bytes.subarray(offset, offset + size);
+  }
+  if (!input.source.file) {
+    throw new Error('没有可读取的内容。');
+  }
+  try {
+    return new Uint8Array(await input.source.file.slice(offset, offset + size).arrayBuffer());
+  } catch {
+    throw new Error(`无法读取文件分片：${input.name || '未命名文件'}。请确认文件仍在本机且未被占用。`);
+  }
+}
+
+async function sha256Input(input: PlainClipInput): Promise<string> {
+  if (input.source.bytes) {
+    return sha256Base64Url(input.source.bytes);
+  }
+  const file = input.source.file;
+  if (!file) {
+    throw new Error('没有可读取的内容。');
+  }
+  const hasher = await createSHA256();
+  hasher.init();
+  if (file.stream) {
+    const reader = file.stream().getReader();
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) {
+          break;
+        }
+        if (value) {
+          hasher.update(value);
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  } else {
+    const chunkSize = defaultChunkPlainBytes;
+    for (let offset = 0; offset < file.size; offset += chunkSize) {
+      hasher.update(await readPlainInputChunk(input, offset, Math.min(chunkSize, file.size - offset)));
+    }
+  }
+  return bytesToBase64Url(hasher.digest('binary') as Uint8Array);
+}
+
+function isChunkedClip(clip: ClipEntry): clip is ClipEntry & { chunkSetId: string; chunks: ClipChunk[] } {
+  return clip.encryption === chunkedEncryption && !!clip.chunkSetId && Array.isArray(clip.chunks) && clip.chunks.length > 0;
+}
+
+function chunkAAD(chunkSetId: string, chunkIndex: number, plainSize: number): Uint8Array {
+  return textEncoder.encode(`${chunkedEncryption}\n${chunkSetId}\n${chunkIndex}\n${plainSize}`);
+}
+
+function concatBytes(chunks: Uint8Array[], total: number): Uint8Array {
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
+function randomCacheToken(): string {
+  const raw = new Uint8Array(16);
+  crypto.getRandomValues(raw);
+  return bytesToBase64Url(raw);
+}
+
+function plainCacheKey(groupID: string, clipID: string) {
+  return `${groupID}:${clipID}`;
+}
+
+function loadClientId() {
+  try {
+    const existing = localStorage.getItem(clientIdStorageKey);
+    if (existing) {
+      return existing;
+    }
+    const created = randomCacheToken();
+    localStorage.setItem(clientIdStorageKey, created);
+    return created;
+  } catch {
+    return randomCacheToken();
+  }
 }
 
 function saveOutcomeMessage(outcome: SaveOutcome, createdMessage: string) {

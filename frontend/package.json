@@ -7,18 +7,21 @@
     "dev": "vite --host 127.0.0.1",
     "dev:lan": "vite --host 0.0.0.0",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "vitest run"
   },
   "dependencies": {
+    "hash-wasm": "^4.12.0",
     "jsqr": "^1.4.0",
     "lucide-solid": "^1.16.0",
     "qrcode": "^1.5.4",
     "solid-js": "^1.9.13",
-    "vite-plugin-solid": "^2.11.12",
-    "vite": "^8.0.14"
+    "vite": "^8.0.14",
+    "vite-plugin-solid": "^2.11.12"
   },
   "devDependencies": {
     "@types/qrcode": "^1.5.6",
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.8"
   }
 }

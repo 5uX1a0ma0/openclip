@@ -14,6 +14,7 @@ type memoryStore struct {
 	group map[string]storage.Group
 	index map[string][]byte
 	blob  map[string]map[string][]byte
+	push  map[string][]storage.PushSubscription
 }
 
 func newMemoryStore() *memoryStore {
@@ -21,6 +22,7 @@ func newMemoryStore() *memoryStore {
 		group: make(map[string]storage.Group),
 		index: make(map[string][]byte),
 		blob:  make(map[string]map[string][]byte),
+		push:  make(map[string][]storage.PushSubscription),
 	}
 }
 
@@ -44,6 +46,23 @@ func (m *memoryStore) WriteGroup(_ context.Context, group storage.Group) error {
 	defer m.mu.Unlock()
 	group.PublicKeyJWK = append([]byte(nil), group.PublicKeyJWK...)
 	m.group[group.GroupID] = group
+	return nil
+}
+
+func (m *memoryStore) ReadPushSubscriptions(_ context.Context, groupID string) ([]storage.PushSubscription, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	subscriptions, ok := m.push[groupID]
+	if !ok {
+		return nil, storage.ErrNotFound
+	}
+	return append([]storage.PushSubscription(nil), subscriptions...), nil
+}
+
+func (m *memoryStore) WritePushSubscriptions(_ context.Context, groupID string, subscriptions []storage.PushSubscription) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.push[groupID] = append([]storage.PushSubscription(nil), subscriptions...)
 	return nil
 }
 

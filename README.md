@@ -9,6 +9,7 @@
 - 创建剪贴板需要 `CLIPBOARD_CREATE_PASSWORD`；加入剪贴板只需要 `olckey1...` 剪贴板密钥。
 - 页面内容实时更新：同一后端实例下的同剪贴板设备写入后，其他已打开页面通过 SSE 刷新列表，不使用轮询。
 - 可选前台剪贴板同步：页面在前台时可在窗口聚焦、重新可见、收到实时更新或浏览器支持的剪贴板变化事件后同步系统剪贴板。
+- 可选后台通知：配置 VAPID 后，浏览器关闭时也可通过 Web Push 收到泛化更新提醒。
 - SolidJS/Vite 前端，支持文本、图片、小文件的粘贴、拖拽、复制、下载和本地预览。
 
 ## 运行
@@ -85,16 +86,29 @@ CLIPBOARD_TRUST_PROXY_HEADERS=true
 - 网络断开、OpenList 临时 `5xx` 或限流 `429` 会保持实时连接重试；远端剪贴板不存在、签名失败或密钥失效时会停止重连。
 - 停止重连不会自动删除本机保存的剪贴板密钥。用户可以手动刷新重试、切换剪贴板、忘记本机记录或重新加入。
 
+## 后台通知
+
+后台通知需要 HTTPS、浏览器通知权限和 VAPID 密钥。生成密钥：
+
+```powershell
+go run ./cmd/server --generate-vapid
+```
+
+把输出的 `CLIPBOARD_VAPID_PUBLIC_KEY`、`CLIPBOARD_VAPID_PRIVATE_KEY` 和 `CLIPBOARD_VAPID_SUBJECT` 写入 `.env` 或 compose 环境变量。未配置时，“通知”开关仍可在页面打开时使用系统通知或页内提示，但浏览器关闭后不会收到 Web Push。
+
+推送通知只包含“剪贴板内容已更新”这类泛化提示，不包含明文内容、文件名或预览。
+
 ## 剪贴板密钥
 
 - 首台设备点击“创建剪贴板”会生成剪贴板密钥，并从该密钥确定性派生剪贴板 ID、密钥校验哈希和 ECDSA P-256 签名身份。
 - 剪贴板密钥格式为 `olckey1.<base64url-key>`，是加入剪贴板的唯一凭据。
 - 已打开剪贴板可生成二维码，其他设备扫码或粘贴密钥后加入同一剪贴板，并从服务器读取剪贴板名称。
 - 服务端保存剪贴板名称、签名公钥和密钥校验哈希，不保存剪贴板密钥或签名私钥。
+- 大文件会按分片在浏览器端加密，并在本机 IndexedDB 缓存密文分片；缓存不保存明文。
 
 ## 存储布局
 
-- 新 V1 路径：`/clipboard/v1/groups/{groupId}/group.json`、`index.enc`、`blobs/YYYY-MM/{clipId}.bin`。
+- 新 V1 路径：`/clipboard/v1/groups/{groupId}/group.json`、`index.enc`、`push-subscriptions.json`、`blobs/YYYY-MM/{clipId}.bin`。
 
 ## 安全边界
 

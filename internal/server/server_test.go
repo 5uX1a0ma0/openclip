@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -13,9 +14,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
+
+	"openlist-clipboard/internal/storage"
 )
 
 type testGroup struct {
@@ -177,6 +181,24 @@ func TestClientIPTrustProxyHeaders(t *testing.T) {
 	}
 }
 
+func TestStaticServesServiceWorkerFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/index.html", []byte("index"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/sw.js", []byte("worker"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	handler := New(Config{MaxBlobBytes: 1024, StaticDir: dir}, newMemoryStore())
+
+	req := httptest.NewRequest(http.MethodGet, "/sw.js", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != "worker" {
+		t.Fatalf("sw.js status=%d body=%q", rec.Code, rec.Body.String())
+	}
+}
+
 func TestIndexEventsBroadcastGroupScoped(t *testing.T) {
 	handler, _ := testServer()
 	groupA := newTestGroup(t, 1)
@@ -213,6 +235,129 @@ func TestIndexEventsBroadcastGroupScoped(t *testing.T) {
 	if !strings.Contains(update, nextHash) {
 		t.Fatalf("update event=%s want hash=%s", update, nextHash)
 	}
+}
+
+func TestRuntimeConfigReportsPushAndChunkSettings(t *testing.T) {
+	store := newMemoryStore()
+	handler := New(Config{
+		MaxBlobBytes:    1024,
+		CreatePassword:  "create-secret",
+		VAPIDPublicKey:  "public-key",
+		VAPIDPrivateKey: "private-key",
+		VAPIDSubject:    "mailto:test@example.com",
+		PushSender:      &recordingPushSender{},
+	}, store)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/runtime-config", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("runtime config status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"webPushEnabled":true`) || !strings.Contains(rec.Body.String(), `"chunkPlainBytes":960`) || !strings.Contains(rec.Body.String(), `"maxBlobBytes":1024`) {
+		t.Fatalf("runtime config body=%s", rec.Body.String())
+	}
+}
+
+func TestPushSubscriptionCRUD(t *testing.T) {
+	store := newMemoryStore()
+	handler := New(Config{
+		MaxBlobBytes:    1024,
+		CreatePassword:  "create-secret",
+		VAPIDPublicKey:  "public-key",
+		VAPIDPrivateKey: "private-key",
+		VAPIDSubject:    "mailto:test@example.com",
+		PushSender:      &recordingPushSender{},
+	}, store)
+	group := newTestGroup(t, 1)
+	createGroup(t, handler, group, http.StatusCreated)
+
+	body, _ := json.Marshal(map[string]any{
+		"clientId": "client-a",
+		"endpoint": "https://push.example/sub-a",
+		"keys": map[string]string{
+			"p256dh": "p256dh-key",
+			"auth":   "auth-key",
+		},
+	})
+	req := signedRequest(t, http.MethodPost, "/api/v1/groups/"+group.id+"/push-subscriptions", body, group, "")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("subscribe status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	subscriptions, err := store.ReadPushSubscriptions(context.Background(), group.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(subscriptions) != 1 || subscriptions[0].ClientID != "client-a" {
+		t.Fatalf("subscriptions=%+v", subscriptions)
+	}
+
+	body, _ = json.Marshal(map[string]string{
+		"clientId": "client-a",
+		"endpoint": "https://push.example/sub-a",
+	})
+	req = signedRequest(t, http.MethodDelete, "/api/v1/groups/"+group.id+"/push-subscriptions", body, group, "")
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unsubscribe status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	subscriptions, err = store.ReadPushSubscriptions(context.Background(), group.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(subscriptions) != 0 {
+		t.Fatalf("subscriptions after delete=%+v", subscriptions)
+	}
+}
+
+func TestSendPushNotificationsSkipsSourceClientAndRemovesExpired(t *testing.T) {
+	store := newMemoryStore()
+	group := newTestGroup(t, 1)
+	if err := store.WritePushSubscriptions(context.Background(), group.id, []storage.PushSubscription{
+		{ClientID: "source", Endpoint: "https://push.example/source", P256DH: "key", Auth: "auth"},
+		{ClientID: "other", Endpoint: "https://push.example/other", P256DH: "key", Auth: "auth"},
+		{ClientID: "expired", Endpoint: "https://push.example/expired", P256DH: "key", Auth: "auth"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sender := &recordingPushSender{removeEndpoint: "https://push.example/expired"}
+	api := &API{store: store, push: sender}
+
+	if err := api.sendPushNotifications(context.Background(), group.id, "source", "hash"); err != nil {
+		t.Fatal(err)
+	}
+	if len(sender.sent) != 2 {
+		t.Fatalf("sent=%+v", sender.sent)
+	}
+	for _, subscription := range sender.sent {
+		if subscription.ClientID == "source" {
+			t.Fatalf("source client was notified: %+v", sender.sent)
+		}
+	}
+	subscriptions, err := store.ReadPushSubscriptions(context.Background(), group.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, subscription := range subscriptions {
+		if subscription.ClientID == "expired" {
+			t.Fatalf("expired subscription was retained: %+v", subscriptions)
+		}
+	}
+}
+
+type recordingPushSender struct {
+	removeEndpoint string
+	sent           []storage.PushSubscription
+}
+
+func (s *recordingPushSender) Send(_ context.Context, subscription storage.PushSubscription, _ []byte) (bool, error) {
+	s.sent = append(s.sent, subscription)
+	return subscription.Endpoint == s.removeEndpoint, nil
 }
 
 func newTestGroup(t *testing.T, seed byte) testGroup {

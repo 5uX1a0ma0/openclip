@@ -536,6 +536,37 @@ button:hover,
   font-size: 15px;
 }
 
+.text-expanded {
+  width: 100%;
+  max-height: min(420px, 58vh);
+  margin: 10px 0 0;
+  padding: 12px;
+  overflow: auto;
+  border: 1px solid #d9e2de;
+  border-radius: 8px;
+  color: #25312e;
+  background: #f7faf8;
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.text-expanded-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  color: #154f63;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.text-expanded-state.error {
+  color: #8a2e2e;
+}
+
 .preview {
   display: block;
   width: min(360px, 100%);

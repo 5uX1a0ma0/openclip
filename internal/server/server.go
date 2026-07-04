@@ -40,6 +40,10 @@ type Config struct {
 	MaxBlobBytes      int64
 	TrustProxyHeaders bool
 	StaticDir         string
+	VAPIDPublicKey    string
+	VAPIDPrivateKey   string
+	VAPIDSubject      string
+	PushSender        PushSender
 }
 
 type API struct {
@@ -48,6 +52,7 @@ type API struct {
 	limiter    *RateLimiter
 	events     *IndexEventHub
 	nonces     *NonceStore
+	push       PushSender
 	indexLocks [32]sync.Mutex
 }
 
@@ -74,14 +79,21 @@ func New(cfg Config, store storage.Store) http.Handler {
 		events:  NewIndexEventHub(),
 		nonces:  NewNonceStore(5 * time.Minute),
 	}
+	api.push = cfg.PushSender
+	if api.push == nil && cfg.VAPIDPublicKey != "" && cfg.VAPIDPrivateKey != "" && cfg.VAPIDSubject != "" {
+		api.push = NewWebPushSender(cfg.VAPIDPublicKey, cfg.VAPIDPrivateKey, cfg.VAPIDSubject)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", api.health)
+	mux.HandleFunc("GET /api/v1/runtime-config", api.runtimeConfig)
 	mux.HandleFunc("POST /api/v1/groups", api.createGroup)
 	mux.HandleFunc("POST /api/v1/groups/{groupID}/join", api.joinGroup)
 	mux.HandleFunc("GET /api/v1/groups/{groupID}/index", api.withGroupAuth(api.getIndex))
 	mux.HandleFunc("PUT /api/v1/groups/{groupID}/index", api.withGroupAuth(api.putIndex))
 	mux.HandleFunc("GET /api/v1/groups/{groupID}/events", api.withGroupAuth(api.indexEvents))
+	mux.HandleFunc("POST /api/v1/groups/{groupID}/push-subscriptions", api.withGroupAuth(api.postPushSubscription))
+	mux.HandleFunc("DELETE /api/v1/groups/{groupID}/push-subscriptions", api.withGroupAuth(api.deletePushSubscription))
 	mux.HandleFunc("POST /api/v1/groups/{groupID}/blobs", api.withGroupAuth(api.postBlob))
 	mux.HandleFunc("GET /api/v1/groups/{groupID}/blobs/{clipID}", api.withGroupAuth(api.getBlob))
 	mux.HandleFunc("DELETE /api/v1/groups/{groupID}/blobs/{clipID}", api.withGroupAuth(api.deleteBlob))
@@ -92,6 +104,26 @@ func New(cfg Config, store storage.Store) http.Handler {
 
 func (a *API) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (a *API) runtimeConfig(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"chunkPlainBytes": a.chunkPlainBytes(),
+		"maxBlobBytes":     a.cfg.MaxBlobBytes,
+		"webPushEnabled":  a.push != nil && a.cfg.VAPIDPublicKey != "",
+		"vapidPublicKey":  a.cfg.VAPIDPublicKey,
+	})
+}
+
+func (a *API) chunkPlainBytes() int64 {
+	const envelopeOverhead = 64
+	if a.cfg.MaxBlobBytes <= envelopeOverhead {
+		return 1
+	}
+	if a.cfg.MaxBlobBytes-envelopeOverhead < defaultChunkPlainBytes {
+		return a.cfg.MaxBlobBytes - envelopeOverhead
+	}
+	return defaultChunkPlainBytes
 }
 
 func (a *API) createGroup(w http.ResponseWriter, r *http.Request) {
@@ -226,6 +258,7 @@ func (a *API) putIndex(w http.ResponseWriter, r *http.Request, groupID string) {
 	var req struct {
 		BaseHash string `json:"baseHash"`
 		Blob     string `json:"blob"`
+		ClientID string `json:"clientId"`
 	}
 	if err := decodeJSON(r, &req, a.cfg.MaxBlobBytes+4096); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request")
@@ -263,6 +296,7 @@ func (a *API) putIndex(w http.ResponseWriter, r *http.Request, groupID string) {
 	}
 	nextHash := hash(data)
 	a.events.Broadcast(groupID, nextHash)
+	a.notifyPushSubscribers(groupID, req.ClientID, nextHash)
 	writeJSON(w, http.StatusOK, map[string]string{"hash": nextHash})
 }
 
@@ -526,6 +560,14 @@ func (a *API) static(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(r.URL.Path, "/assets/") {
 		http.StripPrefix("/assets", http.FileServer(http.Dir(filepath.Join(a.cfg.StaticDir, "assets")))).ServeHTTP(w, r)
 		return
+	}
+	rel := strings.TrimPrefix(filepath.Clean("/"+strings.TrimPrefix(r.URL.Path, "/")), "/")
+	if rel != "." && rel != "" {
+		staticPath := filepath.Join(a.cfg.StaticDir, rel)
+		if info, err := os.Stat(staticPath); err == nil && !info.IsDir() {
+			http.ServeFile(w, r, staticPath)
+			return
+		}
 	}
 	http.ServeFile(w, r, indexPath)
 }

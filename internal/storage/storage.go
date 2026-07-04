@@ -19,10 +19,21 @@ type Group struct {
 	UpdatedAt    int64           `json:"updatedAt"`
 }
 
+type PushSubscription struct {
+	ClientID  string `json:"clientId"`
+	Endpoint  string `json:"endpoint"`
+	P256DH    string `json:"p256dh"`
+	Auth      string `json:"auth"`
+	CreatedAt int64  `json:"createdAt"`
+	UpdatedAt int64  `json:"updatedAt"`
+}
+
 type Store interface {
 	Ensure(ctx context.Context) error
 	ReadGroup(ctx context.Context, groupID string) (Group, error)
 	WriteGroup(ctx context.Context, group Group) error
+	ReadPushSubscriptions(ctx context.Context, groupID string) ([]PushSubscription, error)
+	WritePushSubscriptions(ctx context.Context, groupID string, subscriptions []PushSubscription) error
 	ReadIndex(ctx context.Context, groupID string) ([]byte, error)
 	WriteIndex(ctx context.Context, groupID string, data []byte) error
 	WriteBlob(ctx context.Context, groupID string, clipID string, data io.ReadSeeker, size int64) error
