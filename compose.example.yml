@@ -1,5 +1,6 @@
 services:
   openlist-clipboard:
+    # This service expects an existing OpenList instance. It does not start OpenList.
     build:
       context: .
       dockerfile: Dockerfile
@@ -9,14 +10,19 @@ services:
     ports:
       - "8080:8080"
     environment:
+      # Application
       CLIPBOARD_ADDR: ":8080"
-      CLIPBOARD_ALLOWED_ORIGIN: "${CLIPBOARD_ALLOWED_ORIGIN:-http://localhost:8080}"
+      CLIPBOARD_ALLOWED_ORIGIN: "${CLIPBOARD_ALLOWED_ORIGIN:-}"
       CLIPBOARD_CREATE_PASSWORD: "${CLIPBOARD_CREATE_PASSWORD:?set CLIPBOARD_CREATE_PASSWORD}"
       CLIPBOARD_MAX_BLOB_BYTES: "${CLIPBOARD_MAX_BLOB_BYTES:-52428800}"
       CLIPBOARD_TRUST_PROXY_HEADERS: "${CLIPBOARD_TRUST_PROXY_HEADERS:-false}"
+
+      # Optional Web Push notifications
       CLIPBOARD_VAPID_PUBLIC_KEY: "${CLIPBOARD_VAPID_PUBLIC_KEY:-}"
       CLIPBOARD_VAPID_PRIVATE_KEY: "${CLIPBOARD_VAPID_PRIVATE_KEY:-}"
       CLIPBOARD_VAPID_SUBJECT: "${CLIPBOARD_VAPID_SUBJECT:-}"
+
+      # Existing OpenList instance
       OPENLIST_BASE_URL: "${OPENLIST_BASE_URL:-http://host.docker.internal:5244}"
       OPENLIST_USERNAME: "${OPENLIST_USERNAME:-clipboard}"
       OPENLIST_PASSWORD: "${OPENLIST_PASSWORD:?set OPENLIST_PASSWORD}"
