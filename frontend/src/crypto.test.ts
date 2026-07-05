@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { encryptedCacheKey } from './blob_cache';
 import { bytesToBase64Url, decryptBytes, decryptChunkBytes, encryptBytes, encryptChunkBytes, generateVaultKey, importVaultKey } from './crypto';
+import { Sha256 } from './sha256';
 
 const encoder = new TextEncoder();
 
@@ -41,5 +42,18 @@ describe('encrypted cache keys', () => {
 
     expect(encryptedCacheKey('group-a', hash, 1024, 256)).toBe(encryptedCacheKey('group-a', hash, 1024, 256));
     expect(encryptedCacheKey('group-a', hash, 1024, 256)).not.toBe(encryptedCacheKey('group-a', hash, 2048, 256));
+  });
+});
+
+describe('sha256 fallback', () => {
+  it('matches Web Crypto for streamed chunks', async () => {
+    const input = encoder.encode('streamed content hash without wasm');
+    const hasher = new Sha256();
+    hasher.update(input.subarray(0, 7));
+    hasher.update(input.subarray(7, 19));
+    hasher.update(input.subarray(19));
+
+    const expected = new Uint8Array(await crypto.subtle.digest('SHA-256', input));
+    expect(hasher.digest()).toEqual(expected);
   });
 });

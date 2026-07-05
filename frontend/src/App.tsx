@@ -73,7 +73,7 @@ import {
   upsertGroup
 } from './groups';
 import { decodeQRCodeFromCanvas, qrCodeDataURL } from './qr';
-import { createSHA256 } from 'hash-wasm';
+import { Sha256 } from './sha256';
 import type { ActiveGroup, ClipChunk, ClipEntry, ClipIndex, IndexEvent, RuntimeConfig, SavedGroup } from './types';
 
 const textEncoder = new TextEncoder();
@@ -92,6 +92,7 @@ const syncStateStorageKey = 'openlist-clipboard.sync.state.v1';
 const clientIdStorageKey = 'openlist-clipboard.client-id.v1';
 const scannerMaxEdge = 640;
 const scannerScanIntervalMs = 120;
+const maxTextPreviewChars = 160;
 const maxToastCount = 3;
 const maxPlainCacheEntries = 8;
 const maxPlainCacheBytes = 8 * 1024 * 1024;
@@ -196,6 +197,7 @@ export default function App() {
 
   let scannerVideo: HTMLVideoElement | undefined;
   let scannerCanvas: HTMLCanvasElement | undefined;
+  let fileInput: HTMLInputElement | undefined;
   let scannerStream: MediaStream | null = null;
   let scannerFrame = 0;
   let scannerDone = false;
@@ -220,6 +222,24 @@ export default function App() {
       .clips.filter((clip) => !isExpired(clip))
       .sort((a, b) => clipSortTime(b) - clipSortTime(a))
   );
+  const textPreviewState = createMemo<Record<string, ExpandedTextState>>(() => {
+    const expanded = expandedText();
+    const visibleText: Record<string, ExpandedTextState> = {};
+    for (const clip of activeClips()) {
+      if (clip.kind !== 'text') {
+        continue;
+      }
+      const current = expanded[clip.id];
+      if (current) {
+        visibleText[clip.id] = current;
+        continue;
+      }
+      if (isCompleteTextPreview(clip)) {
+        visibleText[clip.id] = { text: clip.preview };
+      }
+    }
+    return visibleText;
+  });
   const previewModalClip = createMemo(() => activeClips().find((clip) => clip.id === previewModalClipId()) || null);
   const createFormHint = createMemo(() => {
     if (cryptoUnavailable) {
@@ -245,13 +265,16 @@ export default function App() {
     }
     const permission = notificationPermission();
     if (permission === 'granted') {
-      return runtimeConfig().webPushEnabled ? '远端更新通知：后台推送' : '远端更新通知：系统通知';
+      const config = runtimeConfig();
+      return config.webPushEnabled && config.vapidPublicKey && webPushAvailability().available
+        ? '远端更新通知：后台推送'
+        : '远端更新通知：打开页面时系统通知';
     }
     if (permission === 'denied') {
       return '远端更新通知：系统通知已被拒绝，将使用页内提示';
     }
     if (permission === 'unsupported') {
-      return '远端更新通知：当前浏览器将使用页内提示';
+      return `远端更新通知：${notificationUnavailableMessage()}，将使用页内提示`;
     }
     return '远端更新通知：未授予系统通知权限，将使用页内提示';
   });
@@ -290,7 +313,7 @@ export default function App() {
   createEffect(() => {
     const group = activeGroup();
     const config = runtimeConfig();
-    if (group && clipboardNotifyEnabled() && config.webPushEnabled && notificationPermissionState() === 'granted') {
+    if (group && clipboardNotifyEnabled() && config.webPushEnabled && notificationPermissionState() === 'granted' && webPushAvailability().available) {
       void ensurePushSubscription(group);
     }
   });
@@ -393,7 +416,7 @@ export default function App() {
     setIndex(emptyIndex());
     setBaseHash('');
     await loadIndex(opened);
-    if (loadNotificationEnabled(opened.id)) {
+    if (loadNotificationEnabled(opened.id) && webPushAvailability().available) {
       void ensurePushSubscription(opened);
     }
     requestClipboardSync('focus');
@@ -740,7 +763,7 @@ export default function App() {
         kind: 'text',
         name: '文本',
         mime: 'text/plain;charset=utf-8',
-        preview: value.slice(0, 160)
+        preview: textPreview(value)
       });
       setTextDraft('');
       return saveOutcomeMessage(outcome, '已保存');
@@ -748,20 +771,54 @@ export default function App() {
   }
 
   async function addFile(file: File) {
+    await addFiles([file]);
+  }
+
+  async function addFiles(files: File[]) {
+    if (files.length === 0) {
+      return;
+    }
     await run(async () => {
-      if (file.size > maxClientPlainBytes) {
-        throw new Error(`单条内容不能超过 ${formatSize(maxClientPlainBytes)}，请拆成更小的内容后再保存。`);
+      const outcomes: SaveOutcome[] = [];
+      for (const file of files) {
+        outcomes.push(await addFileInput(file));
       }
-      const outcome = await addPlainBytes({
-        source: { file },
-        size: file.size,
-        kind: file.type.startsWith('image/') ? 'image' : 'file',
-        name: file.name || 'clipboard.bin',
-        mime: file.type || 'application/octet-stream',
-        preview: file.type.startsWith('image/') ? file.name || '图片' : file.name || '文件'
-      });
-      return saveOutcomeMessage(outcome, '已上传');
-    }, '已上传', '上传中');
+      if (outcomes.length === 1) {
+        const [outcome] = outcomes;
+        return saveOutcomeMessage(outcome, '已上传');
+      }
+      if (outcomes.every((outcome) => outcome.mode === 'unchanged')) {
+        return '内容已是最新';
+      }
+      return `已处理 ${outcomes.length} 个文件`;
+    }, files.length === 1 ? '已上传' : `已处理 ${files.length} 个文件`, '上传中');
+  }
+
+  async function addFileInput(file: File): Promise<SaveOutcome> {
+    if (file.size > maxClientPlainBytes) {
+      throw new Error(`单条内容不能超过 ${formatSize(maxClientPlainBytes)}，请拆成更小的内容后再保存。`);
+    }
+    return addPlainBytes({
+      source: { file },
+      size: file.size,
+      kind: file.type.startsWith('image/') ? 'image' : 'file',
+      name: file.name || 'clipboard.bin',
+      mime: file.type || 'application/octet-stream',
+      preview: file.type.startsWith('image/') ? file.name || '图片' : file.name || '文件'
+    });
+  }
+
+  function openFilePicker() {
+    if (busy() || !unlocked()) {
+      return;
+    }
+    fileInput?.click();
+  }
+
+  function handleFileInputChange(input: HTMLInputElement) {
+    const files = [...(input.files || [])];
+    input.value = '';
+    void addFiles(files);
   }
 
   async function addPlainBytes(input: PlainClipInput): Promise<SaveOutcome> {
@@ -987,7 +1044,7 @@ export default function App() {
           kind: 'text',
           name: '文本',
           mime: 'text/plain;charset=utf-8',
-          preview: text.slice(0, 160)
+          preview: textPreview(text)
         });
         return saveOutcomeMessage(outcome, '已读取');
       }
@@ -1060,8 +1117,11 @@ export default function App() {
       return;
     }
     if (permission === 'granted') {
-      await ensurePushSubscription(group);
-      showToast(runtimeConfig().webPushEnabled ? '后台通知已开启' : '剪贴板更新通知已开启', 'info');
+      const pushReady = await ensurePushSubscription(group);
+      if (activeGroup()?.id !== groupID || !clipboardNotifyEnabled()) {
+        return;
+      }
+      showToast(pushReady ? '后台通知已开启' : '剪贴板更新通知已开启', 'info');
       return;
     }
     if (permission === 'denied') {
@@ -1069,37 +1129,43 @@ export default function App() {
       return;
     }
     if (permission === 'unsupported') {
-      showToast('当前浏览器不支持系统通知，将使用页内提示', 'info');
+      showToast(`${notificationUnavailableMessage()}，将使用页内提示`, 'info');
       return;
     }
     showToast('未授予系统通知权限，将使用页内提示', 'info');
   }
 
-  async function ensurePushSubscription(group: ActiveGroup) {
+  async function ensurePushSubscription(group: ActiveGroup): Promise<boolean> {
     const config = runtimeConfig();
-    if (!config.webPushEnabled || !config.vapidPublicKey || notificationPermissionState() !== 'granted') {
-      return;
-    }
-    if (!('PushManager' in window)) {
-      showToast('当前浏览器不支持后台推送，将使用打开页面通知', 'info');
-      return;
+    const availability = webPushAvailability();
+    if (!config.webPushEnabled || !config.vapidPublicKey || notificationPermissionState() !== 'granted' || !availability.available) {
+      return false;
     }
     const registration = await registerServiceWorker();
     if (!registration) {
       showToast('后台通知注册失败，将使用打开页面通知', 'info');
-      return;
+      return false;
     }
-    const subscription =
-      (await registration.pushManager.getSubscription()) ||
-      (await registration.pushManager.subscribe({
-        userVisibleOnly: true,
-        applicationServerKey: bytesToArrayBuffer(base64UrlToBytes(config.vapidPublicKey))
-      }));
-    const json = subscription.toJSON();
-    if (!json.endpoint || !json.keys?.p256dh || !json.keys.auth) {
-      throw new Error('浏览器返回了不完整的推送订阅。');
+    try {
+      const subscription =
+        (await registration.pushManager.getSubscription()) ||
+        (await registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: bytesToArrayBuffer(base64UrlToBytes(config.vapidPublicKey))
+        }));
+      const json = subscription.toJSON();
+      if (!json.endpoint || !json.keys?.p256dh || !json.keys.auth) {
+        throw new Error('浏览器返回了不完整的推送订阅。');
+      }
+      await guardRemoteOperation(group, () => savePushSubscription(group, clientId, json));
+      return true;
+    } catch (err) {
+      if (isFatalAuthOrGroupError(err)) {
+        throw err;
+      }
+      showToast(`后台推送不可用：${displayError(err)}。打开页面时仍会通知`, 'info');
+      return false;
     }
-    await guardRemoteOperation(group, () => savePushSubscription(group, clientId, json));
   }
 
   async function removePushSubscription(group: ActiveGroup) {
@@ -1111,8 +1177,10 @@ export default function App() {
       }
       return;
     }
-    const registration = await navigator.serviceWorker.getRegistration();
-    const subscription = await registration?.pushManager.getSubscription();
+    const registration = (await navigator.serviceWorker.getRegistration()) as
+      | (ServiceWorkerRegistration & { pushManager?: PushManager })
+      | undefined;
+    const subscription = await registration?.pushManager?.getSubscription();
     const endpoint = subscription?.endpoint;
     if (endpoint) {
       try {
@@ -1141,37 +1209,60 @@ export default function App() {
     lastNotifiedGroupID = group.id;
     lastNotifiedIndexHash = hash;
 
+    void showUpdateNotification(group).then((shown) => {
+      if (!shown) {
+        showToast(updateNotificationBody, 'info');
+      }
+    });
+  }
+
+  async function showUpdateNotification(group: ActiveGroup): Promise<boolean> {
     const permission = notificationPermissionState();
     setNotificationPermission(permission);
-    if (permission === 'granted') {
-      try {
-        closeUpdateNotification();
-        const notification = new Notification(notificationTitle, {
-          body: updateNotificationBody,
-          tag: `openlist-clipboard-update-${group.id}`
-        });
-        activeUpdateNotification = notification;
-        notification.onclick = () => {
-          window.focus();
-          notification.close();
-        };
-        notification.onclose = () => {
-          if (activeUpdateNotification === notification) {
-            activeUpdateNotification = null;
-          }
-        };
-        notification.onerror = () => {
-          if (activeUpdateNotification === notification) {
-            activeUpdateNotification = null;
-          }
-          showToast(updateNotificationBody, 'info');
-        };
-        return;
-      } catch {
-        setNotificationPermission(notificationPermissionState());
-      }
+    if (permission !== 'granted') {
+      return false;
     }
-    showToast(updateNotificationBody, 'info');
+    closeUpdateNotification();
+    try {
+      const registration = await registerServiceWorker();
+      if (registration && typeof registration.showNotification === 'function') {
+        await registration.showNotification(notificationTitle, {
+          body: updateNotificationBody,
+          tag: `openlist-clipboard-update-${group.id}`,
+          renotify: true,
+          data: { url: '/' }
+        } as NotificationOptions & { renotify: boolean });
+        return true;
+      }
+    } catch {
+      // Fall through to the page Notification API.
+    }
+    try {
+      const notification = new Notification(notificationTitle, {
+        body: updateNotificationBody,
+        tag: `openlist-clipboard-update-${group.id}`
+      });
+      activeUpdateNotification = notification;
+      notification.onclick = () => {
+        window.focus();
+        notification.close();
+      };
+      notification.onclose = () => {
+        if (activeUpdateNotification === notification) {
+          activeUpdateNotification = null;
+        }
+      };
+      notification.onerror = () => {
+        if (activeUpdateNotification === notification) {
+          activeUpdateNotification = null;
+        }
+        showToast(updateNotificationBody, 'info');
+      };
+      return true;
+    } catch {
+      setNotificationPermission(notificationPermissionState());
+      return false;
+    }
   }
 
   function closeUpdateNotification() {
@@ -1485,7 +1576,7 @@ export default function App() {
                 bytes,
                 name: '文本',
                 mime: 'text/plain;charset=utf-8',
-                preview: text.slice(0, 160),
+                preview: textPreview(text),
                 hash: await sha256Base64Url(bytes)
               };
             }
@@ -1512,7 +1603,7 @@ export default function App() {
       bytes,
       name: '文本',
       mime: 'text/plain;charset=utf-8',
-      preview: text.slice(0, 160),
+      preview: textPreview(text),
       hash: await sha256Base64Url(bytes)
     };
   }
@@ -1745,7 +1836,7 @@ export default function App() {
     const files = clipboardFilesFromPaste(event);
     if (files.length > 0) {
       event.preventDefault();
-      files.forEach((file) => void addFile(file));
+      void addFiles(files);
       return;
     }
     if (isTyping()) {
@@ -1762,7 +1853,7 @@ export default function App() {
           kind: 'text',
           name: '文本',
           mime: 'text/plain;charset=utf-8',
-          preview: text.slice(0, 160)
+          preview: textPreview(text)
         });
         return saveOutcomeMessage(outcome, '已保存');
       }, '已保存', '保存中');
@@ -1774,7 +1865,7 @@ export default function App() {
     if (!unlocked()) {
       return;
     }
-    [...(event.dataTransfer?.files || [])].forEach((file) => void addFile(file));
+    void addFiles([...(event.dataTransfer?.files || [])]);
   }
 
   function preventDefault(event: Event) {
@@ -2012,11 +2103,18 @@ export default function App() {
             rows={4}
           />
           <div class="composer-actions">
-            <label class="file-button" title="上传文件">
+            <button class="file-button" type="button" title="上传文件" disabled={busy()} onClick={openFilePicker}>
               <Upload size={17} />
               文件
-              <input type="file" multiple onChange={(event) => [...(event.currentTarget.files || [])].forEach((file) => void addFile(file))} />
-            </label>
+            </button>
+            <input
+              ref={(el) => (fileInput = el)}
+              class="file-input"
+              type="file"
+              multiple
+              tabindex={-1}
+              onChange={(event) => handleFileInputChange(event.currentTarget)}
+            />
             <button onClick={() => void addText()} disabled={busy() || textDraft().trim().length === 0}>
               <FileText size={17} />
               保存
@@ -2058,18 +2156,20 @@ export default function App() {
                       <span>{formatSize(clip.size)} · {formatTime(clipSortTime(clip))}</span>
                     </div>
                     <Show when={clip.kind === 'text'}>
-                      <p class="text-preview">{clip.preview || '文本'}</p>
-                      <Show when={expandedText()[clip.id]?.loading}>
+                      <Show when={!textPreviewState()[clip.id]?.text}>
+                        <p class="text-preview">{clip.preview || '文本'}</p>
+                      </Show>
+                      <Show when={textPreviewState()[clip.id]?.loading}>
                         <div class="text-expanded-state">
                           <Loader2 class="spin" size={14} />
                           解密中
                         </div>
                       </Show>
-                      <Show when={expandedText()[clip.id]?.error}>
-                        <div class="text-expanded-state error">{expandedText()[clip.id]?.error}</div>
+                      <Show when={textPreviewState()[clip.id]?.error}>
+                        <div class="text-expanded-state error">{textPreviewState()[clip.id]?.error}</div>
                       </Show>
-                      <Show when={expandedText()[clip.id]?.text}>
-                        <pre class="text-expanded">{expandedText()[clip.id]?.text}</pre>
+                      <Show when={textPreviewState()[clip.id]?.text}>
+                        <pre class="text-expanded">{textPreviewState()[clip.id]?.text}</pre>
                       </Show>
                     </Show>
                     <Show when={clip.kind === 'image' && previewUrls()[clip.id]}>
@@ -2101,7 +2201,7 @@ export default function App() {
                         </button>
                       </Show>
                     </Show>
-                    <Show when={clip.kind === 'text'}>
+                    <Show when={clip.kind === 'text' && !isCompleteTextPreview(clip)}>
                       <button
                         class="icon-button"
                         title={expandedText()[clip.id] ? '收起全文' : '展开全文'}
@@ -2270,8 +2370,7 @@ async function sha256Input(input: PlainClipInput): Promise<string> {
   if (!file) {
     throw new Error('没有可读取的内容。');
   }
-  const hasher = await createSHA256();
-  hasher.init();
+  const hasher = new Sha256();
   if (file.stream) {
     const reader = file.stream().getReader();
     try {
@@ -2293,7 +2392,7 @@ async function sha256Input(input: PlainClipInput): Promise<string> {
       hasher.update(await readPlainInputChunk(input, offset, Math.min(chunkSize, file.size - offset)));
     }
   }
-  return bytesToBase64Url(hasher.digest('binary') as Uint8Array);
+  return bytesToBase64Url(hasher.digest());
 }
 
 function isChunkedClip(clip: ClipEntry): clip is ClipEntry & { chunkSetId: string; chunks: ClipChunk[] } {
@@ -2388,6 +2487,14 @@ function clipboardFilesFromPaste(event: ClipboardEvent): File[] {
     .filter((file): file is File => file !== null);
 }
 
+function textPreview(text: string) {
+  return text.slice(0, maxTextPreviewChars);
+}
+
+function isCompleteTextPreview(clip: ClipEntry) {
+  return clip.kind === 'text' && clip.size <= textEncoder.encode(clip.preview || '').byteLength;
+}
+
 function normalizePastedFile(file: File, itemMime = ''): File {
   if (file.name) {
     return file;
@@ -2459,7 +2566,52 @@ function notificationPermissionState(): NotificationSupportState {
   if (typeof window === 'undefined' || !window.isSecureContext || typeof Notification === 'undefined') {
     return 'unsupported';
   }
+  if (isIOSSafari() && !isStandaloneWebApp()) {
+    return 'unsupported';
+  }
   return Notification.permission;
+}
+
+function notificationUnavailableMessage() {
+  if (typeof window === 'undefined' || !window.isSecureContext) {
+    return '系统通知需要 HTTPS 或 localhost';
+  }
+  if (typeof Notification === 'undefined') {
+    return isIOSSafari() && !isStandaloneWebApp()
+      ? 'iOS Safari 需要先添加到主屏幕后才能使用系统通知'
+      : '当前浏览器不支持系统通知';
+  }
+  return '当前浏览器不支持系统通知';
+}
+
+function webPushAvailability(): { available: boolean; reason?: string } {
+  if (typeof window === 'undefined' || !window.isSecureContext) {
+    return { available: false, reason: '后台通知需要 HTTPS 或 localhost' };
+  }
+  if (!('serviceWorker' in navigator)) {
+    return { available: false, reason: '当前浏览器不支持 Service Worker' };
+  }
+  if (isIOSSafari() && !isStandaloneWebApp()) {
+    return { available: false, reason: 'iOS Safari 需要先添加到主屏幕后才能使用后台通知' };
+  }
+  if (!('PushManager' in window)) {
+    return {
+      available: false,
+      reason: isIOSSafari() ? 'iOS Safari 需要先添加到主屏幕后才能使用后台通知' : '当前浏览器不支持后台推送'
+    };
+  }
+  return { available: true };
+}
+
+function isIOSSafari() {
+  const platform = navigator.platform || '';
+  const userAgent = navigator.userAgent || '';
+  const isiOS = /iPad|iPhone|iPod/.test(platform) || (platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  return isiOS && /Safari/i.test(userAgent) && !/CriOS|FxiOS|EdgiOS|OPiOS/i.test(userAgent);
+}
+
+function isStandaloneWebApp() {
+  return window.matchMedia('(display-mode: standalone)').matches || (navigator as Navigator & { standalone?: boolean }).standalone === true;
 }
 
 function requestSystemNotificationPermission(): Promise<NotificationSupportState> {
@@ -2468,22 +2620,27 @@ function requestSystemNotificationPermission(): Promise<NotificationSupportState
   }
   return new Promise((resolve) => {
     let settled = false;
-    const settle = (permission: NotificationPermission) => {
+    let fallback = 0;
+    const settle = (permission: NotificationSupportState) => {
       if (settled) {
         return;
       }
       settled = true;
+      if (fallback) {
+        window.clearTimeout(fallback);
+      }
       resolve(permission);
     };
+    fallback = window.setTimeout(() => settle(notificationPermissionState()), 1200);
     try {
       const result = (Notification.requestPermission as (
         callback?: (permission: NotificationPermission) => void
       ) => Promise<NotificationPermission> | void)(settle);
       if (result && typeof result.then === 'function') {
-        result.then(settle, () => resolve(notificationPermissionState()));
+        result.then(settle, () => settle(notificationPermissionState()));
       }
     } catch {
-      resolve(notificationPermissionState());
+      settle(notificationPermissionState());
     }
   });
 }
