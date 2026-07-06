@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import { encryptedCacheKey } from './blob_cache';
-import { bytesToBase64Url, decryptBytes, decryptChunkBytes, encryptBytes, encryptChunkBytes, generateVaultKey, importVaultKey } from './crypto';
+import {
+  bytesToArrayBuffer,
+  bytesToBase64Url,
+  decryptBytes,
+  decryptChunkBytes,
+  encryptBytes,
+  encryptChunkBytes,
+  generateVaultKey,
+  importVaultKey
+} from './crypto';
 import { Sha256 } from './sha256';
 
 const encoder = new TextEncoder();
@@ -42,6 +51,23 @@ describe('encrypted cache keys', () => {
 
     expect(encryptedCacheKey('group-a', hash, 1024, 256)).toBe(encryptedCacheKey('group-a', hash, 1024, 256));
     expect(encryptedCacheKey('group-a', hash, 1024, 256)).not.toBe(encryptedCacheKey('group-a', hash, 2048, 256));
+  });
+});
+
+describe('byte buffer conversion', () => {
+  it('reuses complete ArrayBuffer views', () => {
+    const bytes = new Uint8Array([1, 2, 3]);
+
+    expect(bytesToArrayBuffer(bytes)).toBe(bytes.buffer);
+  });
+
+  it('copies partial ArrayBuffer views', () => {
+    const source = new Uint8Array([1, 2, 3, 4]);
+    const partial = source.subarray(1, 3);
+    const buffer = bytesToArrayBuffer(partial);
+
+    expect(buffer).not.toBe(source.buffer);
+    expect(new Uint8Array(buffer)).toEqual(new Uint8Array([2, 3]));
   });
 });
 

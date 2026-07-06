@@ -50,16 +50,15 @@ import {
   base64UrlToBytes,
   bytesToArrayBuffer,
   bytesToBase64Url,
-  decryptChunkBytes,
   decryptBytes,
   decryptIndex,
   emptyIndex,
-  encryptChunkBytes,
   encryptBytes,
   encryptIndex,
   mergeIndexes,
   webCryptoUnavailableReason
 } from './crypto';
+import { closeCryptoWorker, decryptChunkBytesFast, encryptChunkBytesFast } from './crypto_worker_client';
 import {
   activateGroup,
   activeGroupId,
@@ -96,6 +95,7 @@ const maxTextPreviewChars = 160;
 const maxToastCount = 3;
 const maxPlainCacheEntries = 8;
 const maxPlainCacheBytes = 8 * 1024 * 1024;
+const maxChunkCryptoConcurrency = 3;
 const notificationTitle = 'OpenList Clipboard';
 const updateNotificationBody = '剪贴板内容已更新';
 
@@ -330,6 +330,7 @@ export default function App() {
     closeIndexEvents();
     closeUpdateNotification();
     stopInviteScanner();
+    closeCryptoWorker();
     plainCache.clear();
     Object.values(previewUrls()).forEach(URL.revokeObjectURL);
     toastTimers.forEach((timer) => window.clearTimeout(timer));
@@ -416,6 +417,7 @@ export default function App() {
     setIndex(emptyIndex());
     setBaseHash('');
     await loadIndex(opened);
+    void clearAppBadge();
     if (loadNotificationEnabled(opened.id) && webPushAvailability().available) {
       void ensurePushSubscription(opened);
     }
@@ -441,6 +443,7 @@ export default function App() {
     setTextDraft('');
     setPreviewModalClipId('');
     setPersistentNotice(null);
+    void clearAppBadge();
   }
 
   function removeActiveGroup() {
@@ -601,6 +604,7 @@ export default function App() {
       if (clipboardSyncEnabled()) {
         requestClipboardSync('focus');
       }
+      void clearAppBadge();
       return changed ? '已刷新并更新列表' : '已刷新，内容已是最新';
     }, '已刷新', '刷新中');
   }
@@ -887,19 +891,21 @@ export default function App() {
     chunkSize: number,
     chunkSetId: string
   ): Promise<CachedEncryptedChunk[]> {
-    const encryptedChunks: CachedEncryptedChunk[] = [];
-    let index = 0;
-    for (let offset = 0; offset < input.size; offset += chunkSize) {
-      const plain = await readPlainInputChunk(input, offset, Math.min(chunkSize, input.size - offset));
-      const encrypted = await encryptChunkBytes(group.vaultCryptoKey, plain, chunkAAD(chunkSetId, index, plain.byteLength));
-      encryptedChunks.push({
+    const jobs: Array<{ index: number; offset: number; size: number }> = [];
+    for (let offset = 0, index = 0; offset < input.size; offset += chunkSize, index += 1) {
+      jobs.push({ index, offset, size: Math.min(chunkSize, input.size - offset) });
+    }
+    const encryptedChunks = await mapConcurrent(jobs, chunkCryptoConcurrency(), async ({ index, offset, size }) => {
+      const plain = await readPlainInputChunk(input, offset, size);
+      const plainSize = plain.byteLength;
+      const encrypted = await encryptChunkBytesFast(group.vaultCryptoKey, plain, chunkAAD(chunkSetId, index, plainSize), { transfer: true });
+      return {
         index,
-        plainSize: plain.byteLength,
+        plainSize,
         encryptedSize: encrypted.byteLength,
         encrypted
-      });
-      index += 1;
-    }
+      };
+    });
     await writeEncryptedClipCache({
       key: encryptedCacheKey(group.id, contentHash, input.size, chunkSize),
       groupId: group.id,
@@ -1106,6 +1112,7 @@ export default function App() {
     if (!enabled) {
       closeUpdateNotification();
       await removePushSubscription(group);
+      void clearAppBadge();
       showToast('剪贴板更新通知已关闭', 'info');
       return;
     }
@@ -1209,6 +1216,7 @@ export default function App() {
     lastNotifiedGroupID = group.id;
     lastNotifiedIndexHash = hash;
 
+    void setAppBadge(1);
     void showUpdateNotification(group).then((shown) => {
       if (!shown) {
         showToast(updateNotificationBody, 'info');
@@ -1308,6 +1316,10 @@ export default function App() {
     const group = activeGroup();
     if (!group || cryptoUnavailable || !canAttemptForegroundSync()) {
       return;
+    }
+    void clearAppBadge();
+    if (clipboardNotifyEnabled() && webPushAvailability().available && notificationPermissionState() === 'granted') {
+      void ensurePushSubscription(group);
     }
     if (reconnectBlockedGroupID === group.id) {
       setPersistentNotice({ kind: 'error', message: remoteClipboardUnavailableMessage });
@@ -1689,15 +1701,11 @@ export default function App() {
     }
     let plain: Uint8Array;
     if (isChunkedClip(clip)) {
-      const chunks: Uint8Array[] = [];
-      let total = 0;
-      for (let index = 0; index < clip.chunks.length; index += 1) {
-        const chunk = clip.chunks[index];
+      const chunks = await mapConcurrent(clip.chunks, chunkCryptoConcurrency(), async (chunk, index) => {
         const envelope = await guardRemoteOperation(group, () => downloadBlob(group, chunk.blobId));
-        const decrypted = await decryptChunkBytes(group.vaultCryptoKey, envelope, chunkAAD(clip.chunkSetId, index, chunk.size));
-        chunks.push(decrypted);
-        total += decrypted.byteLength;
-      }
+        return decryptChunkBytesFast(group.vaultCryptoKey, envelope, chunkAAD(clip.chunkSetId, index, chunk.size), { transfer: true });
+      });
+      const total = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
       plain = concatBytes(chunks, total);
     } else {
       plain = await decryptBytes(group.vaultCryptoKey, await guardRemoteOperation(group, () => downloadBlob(group, clip.blobId)));
@@ -2413,6 +2421,30 @@ function concatBytes(chunks: Uint8Array[], total: number): Uint8Array {
   return out;
 }
 
+async function mapConcurrent<T, R>(items: T[], concurrency: number, mapper: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workerCount = Math.max(1, Math.min(Math.floor(concurrency), items.length));
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      for (;;) {
+        const index = next;
+        next += 1;
+        if (index >= items.length) {
+          return;
+        }
+        results[index] = await mapper(items[index], index);
+      }
+    })
+  );
+  return results;
+}
+
+function chunkCryptoConcurrency() {
+  const cores = typeof navigator === 'undefined' ? 2 : navigator.hardwareConcurrency || 2;
+  return Math.max(1, Math.min(maxChunkCryptoConcurrency, cores - 1 || 1));
+}
+
 function randomCacheToken(): string {
   const raw = new Uint8Array(16);
   crypto.getRandomValues(raw);
@@ -2578,7 +2610,7 @@ function notificationUnavailableMessage() {
   }
   if (typeof Notification === 'undefined') {
     return isIOSSafari() && !isStandaloneWebApp()
-      ? 'iOS Safari 需要先添加到主屏幕后才能使用系统通知'
+      ? 'iOS Safari 需要先从 Safari 分享菜单添加到主屏幕，并从主屏幕重新打开后才能使用系统通知'
       : '当前浏览器不支持系统通知';
   }
   return '当前浏览器不支持系统通知';
@@ -2592,15 +2624,41 @@ function webPushAvailability(): { available: boolean; reason?: string } {
     return { available: false, reason: '当前浏览器不支持 Service Worker' };
   }
   if (isIOSSafari() && !isStandaloneWebApp()) {
-    return { available: false, reason: 'iOS Safari 需要先添加到主屏幕后才能使用后台通知' };
+    return { available: false, reason: 'iOS Safari 需要先从 Safari 分享菜单添加到主屏幕，并从主屏幕重新打开后才能使用后台通知' };
   }
   if (!('PushManager' in window)) {
     return {
       available: false,
-      reason: isIOSSafari() ? 'iOS Safari 需要先添加到主屏幕后才能使用后台通知' : '当前浏览器不支持后台推送'
+      reason: isIOSSafari()
+        ? 'iOS Safari 需要先从 Safari 分享菜单添加到主屏幕，并从主屏幕重新打开后才能使用后台通知'
+        : '当前浏览器不支持后台推送'
     };
   }
   return { available: true };
+}
+
+async function setAppBadge(count: number) {
+  const nav = navigator as Navigator & { setAppBadge?: (count?: number) => Promise<void> };
+  if (typeof nav.setAppBadge !== 'function') {
+    return;
+  }
+  try {
+    await nav.setAppBadge(count);
+  } catch {
+    // App badge support varies by browser and user settings.
+  }
+}
+
+async function clearAppBadge() {
+  const nav = navigator as Navigator & { clearAppBadge?: () => Promise<void> };
+  if (typeof nav.clearAppBadge !== 'function') {
+    return;
+  }
+  try {
+    await nav.clearAppBadge();
+  } catch {
+    // App badge support varies by browser and user settings.
+  }
 }
 
 function isIOSSafari() {

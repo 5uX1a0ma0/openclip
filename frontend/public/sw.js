@@ -1,18 +1,27 @@
 self.addEventListener('push', (event) => {
-  let payload = {};
+  const payload = parsePushPayload(event.data);
+  const title = textValue(payload.title, 'OpenList Clipboard');
+  const body = textValue(payload.body, '剪贴板内容已更新');
+  const targetUrl = notificationTargetUrl(payload);
   try {
-    payload = event.data ? event.data.json() : {};
+    if (self.navigator?.setAppBadge) {
+      event.waitUntil(self.navigator.setAppBadge(1).catch(() => undefined));
+    }
   } catch {
-    payload = {};
+    // Badging is best effort and not required for notification delivery.
   }
-  const title = typeof payload.title === 'string' ? payload.title : 'OpenList Clipboard';
-  const body = typeof payload.body === 'string' ? payload.body : '剪贴板内容已更新';
   event.waitUntil(
     self.registration.showNotification(title, {
       body,
       tag: 'openlist-clipboard-update',
       renotify: true,
-      data: { url: '/' }
+      icon: '/icon.svg',
+      badge: '/icon.svg',
+      data: {
+        url: targetUrl,
+        groupId: textValue(payload.groupId, ''),
+        hash: textValue(payload.hash, '')
+      }
     })
   );
 });
@@ -34,3 +43,34 @@ self.addEventListener('notificationclick', (event) => {
     })
   );
 });
+
+function parsePushPayload(data) {
+  if (!data) {
+    return {};
+  }
+  try {
+    const parsed = data.json();
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    try {
+      const text = data.text();
+      return text ? { body: text } : {};
+    } catch {
+      return {};
+    }
+  }
+}
+
+function textValue(value, fallback) {
+  return typeof value === 'string' && value ? value : fallback;
+}
+
+function notificationTargetUrl(payload) {
+  const url = textValue(payload.url, '/');
+  try {
+    const target = new URL(url, self.location.origin);
+    return target.origin === self.location.origin ? target.href : new URL('/', self.location.origin).href;
+  } catch {
+    return new URL('/', self.location.origin).href;
+  }
+}

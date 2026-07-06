@@ -270,6 +270,9 @@ export function base64ToBytes(value: string): Uint8Array {
 }
 
 export function bytesToArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  if (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength && bytes.buffer instanceof ArrayBuffer) {
+    return bytes.buffer;
+  }
   const copy = new Uint8Array(bytes.byteLength);
   copy.set(bytes);
   return copy.buffer;

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="OpenList Clipboard">
+  <rect width="512" height="512" rx="96" fill="#f5f7f4" />
+  <rect x="132" y="96" width="248" height="320" rx="34" fill="#1f6f78" />
+  <rect x="172" y="142" width="168" height="34" rx="17" fill="#f5f7f4" />
+  <rect x="178" y="220" width="156" height="24" rx="12" fill="#f5f7f4" opacity="0.92" />
+  <rect x="178" y="276" width="118" height="24" rx="12" fill="#f5f7f4" opacity="0.92" />
+  <rect x="178" y="332" width="156" height="24" rx="12" fill="#f5f7f4" opacity="0.92" />
+  <path d="M214 112c0-24 18-44 42-44s42 20 42 44h-32c0-7-4-12-10-12s-10 5-10 12z" fill="#1f6f78" />
+</svg>
