@@ -98,6 +98,10 @@ const maxPlainCacheBytes = 8 * 1024 * 1024;
 const maxChunkCryptoConcurrency = 3;
 const notificationTitle = 'OpenList Clipboard';
 const updateNotificationBody = '剪贴板内容已更新';
+const appClipboardPayloadBlobMime = 'application/vnd.openlist-clipboard.clip';
+const appClipboardPayloadClipboardType = `web ${appClipboardPayloadBlobMime}`;
+const appClipboardPayloadMagic = 'OLC_CLIP_V1\n';
+const appClipboardPayloadMagicBytes = new TextEncoder().encode(appClipboardPayloadMagic);
 
 type LiveState = 'offline' | 'connecting' | 'live';
 type IndexStream = { close: () => void };
@@ -114,7 +118,7 @@ type PersistentNotice = {
   message: string;
 };
 type ClipboardSnapshot = {
-  kind: 'text' | 'image';
+  kind: ClipEntry['kind'];
   bytes: Uint8Array;
   name: string;
   mime: string;
@@ -159,6 +163,19 @@ type ExpandedTextState = {
   loading?: boolean;
   text?: string;
   error?: string;
+};
+type RichClipboard = Clipboard & {
+  read?: () => Promise<ClipboardItem[]>;
+  write?: (items: ClipboardItem[]) => Promise<void>;
+};
+type AppClipboardPayloadHeader = {
+  app: 'openlist-clipboard';
+  version: 1;
+  kind: 'image' | 'file';
+  name: string;
+  mime: string;
+  size: number;
+  contentHash?: string;
 };
 
 const clientId = loadClientId();
@@ -782,20 +799,41 @@ export default function App() {
     if (files.length === 0) {
       return;
     }
+    await run(() => saveFileInputs(files, '已上传'), files.length === 1 ? '已上传' : `已处理 ${files.length} 个文件`, '上传中');
+  }
+
+  async function pasteFiles(files: File[]) {
     await run(async () => {
-      const outcomes: SaveOutcome[] = [];
-      for (const file of files) {
-        outcomes.push(await addFileInput(file));
+      const appInput = await tryReadAppClipboardInput();
+      if (appInput) {
+        const outcome = await addPlainBytes(appInput);
+        return saveOutcomeMessage(outcome, '已粘贴');
       }
-      if (outcomes.length === 1) {
-        const [outcome] = outcomes;
-        return saveOutcomeMessage(outcome, '已上传');
-      }
-      if (outcomes.every((outcome) => outcome.mode === 'unchanged')) {
-        return '内容已是最新';
-      }
-      return `已处理 ${outcomes.length} 个文件`;
-    }, files.length === 1 ? '已上传' : `已处理 ${files.length} 个文件`, '上传中');
+      return saveFileInputs(files, '已粘贴');
+    }, files.length === 1 ? '已粘贴' : `已处理 ${files.length} 个文件`, '粘贴中');
+  }
+
+  async function pasteAppClipboardPayload() {
+    await run(async () => {
+      const appInput = await readAppClipboardInput();
+      const outcome = await addPlainBytes(appInput);
+      return saveOutcomeMessage(outcome, '已粘贴');
+    }, '已粘贴', '粘贴中');
+  }
+
+  async function saveFileInputs(files: File[], createdMessage: string): Promise<string> {
+    const outcomes: SaveOutcome[] = [];
+    for (const file of files) {
+      outcomes.push(await addFileInput(file));
+    }
+    if (outcomes.length === 1) {
+      const [outcome] = outcomes;
+      return saveOutcomeMessage(outcome, createdMessage);
+    }
+    if (outcomes.every((outcome) => outcome.mode === 'unchanged')) {
+      return '内容已是最新';
+    }
+    return `已处理 ${outcomes.length} 个文件`;
   }
 
   async function addFileInput(file: File): Promise<SaveOutcome> {
@@ -1019,6 +1057,11 @@ export default function App() {
   async function readClipboard() {
     await run(async () => {
       const nav = requireClipboardAccess();
+      const appInput = await tryReadAppClipboardInput();
+      if (appInput) {
+        const outcome = await addPlainBytes(appInput);
+        return saveOutcomeMessage(outcome, '已读取');
+      }
       if (typeof nav.read === 'function') {
         const items = await nav.read();
         for (const item of items) {
@@ -1061,7 +1104,7 @@ export default function App() {
   async function copyClip(clip: ClipEntry) {
     await run(async () => {
       if (!canCopyClip(clip)) {
-        throw new Error(clip.kind === 'image' ? '当前浏览器不支持复制图片到系统剪贴板。' : '文件不能复制到系统剪贴板，请使用下载。');
+        throw new Error(clip.kind === 'image' ? '当前浏览器不支持复制图片到系统剪贴板。' : '当前浏览器不支持复制文件到系统剪贴板。');
       }
       const nav = requireClipboardAccess();
       const plain = await plainBytes(clip);
@@ -1072,12 +1115,9 @@ export default function App() {
         await nav.writeText(textDecoder.decode(plain));
         return;
       }
-      if (clip.kind === 'image' && canWriteImageClipboard()) {
-        const blob = new Blob([bytesToArrayBuffer(plain)], { type: clip.mime || 'image/png' });
-        await nav.write([new ClipboardItem({ [blob.type]: blob })]);
-        return;
-      }
-      throw new Error('文件不能复制到系统剪贴板，请使用下载。');
+      const contentHash = clip.contentHash || (await sha256Base64Url(plain));
+      const mode = await writeBinaryClipToClipboard(nav, clip, plain, contentHash);
+      return mode === 'exact' ? undefined : '已复制；当前浏览器未保留原始图片字节，跨剪贴板粘贴可能重新编码';
     }, '已复制');
   }
 
@@ -1507,7 +1547,7 @@ export default function App() {
     }
 
     const plain = await plainBytes(clip);
-    const hash = await sha256Base64Url(plain);
+    const hash = clip.contentHash || (await sha256Base64Url(plain));
     if (state.remoteClipId === clip.id && state.localHash === hash) {
       return;
     }
@@ -1515,8 +1555,7 @@ export default function App() {
     if (clip.kind === 'text') {
       await nav.writeText(textDecoder.decode(plain));
     } else if (clip.kind === 'image' && 'ClipboardItem' in window && typeof nav.write === 'function') {
-      const blob = new Blob([bytesToArrayBuffer(plain)], { type: clip.mime || 'image/png' });
-      await nav.write([new ClipboardItem({ [blob.type]: blob })]);
+      await writeBinaryClipToClipboard(nav, clip, plain, hash);
     } else {
       setPersistentNotice({ kind: 'info', message: '当前浏览器不能自动写入图片剪贴板' });
       return;
@@ -1562,6 +1601,17 @@ export default function App() {
     if (typeof nav.read === 'function') {
       try {
         const items = await nav.read();
+        const appInput = await readAppClipboardInputFromItems(items);
+        if (appInput && appInput.source.bytes) {
+          return {
+            kind: appInput.kind,
+            bytes: appInput.source.bytes,
+            name: appInput.name,
+            mime: appInput.mime,
+            preview: appInput.preview,
+            hash: appInput.contentHash || (await sha256Base64Url(appInput.source.bytes))
+          };
+        }
         for (const item of items) {
           const imageType = item.types.find((type) => type.startsWith('image/'));
           if (imageType) {
@@ -1842,9 +1892,13 @@ export default function App() {
       return;
     }
     const files = clipboardFilesFromPaste(event);
-    if (files.length > 0) {
+    if (files.length > 0 || clipboardContainsAppPayload(event.clipboardData)) {
       event.preventDefault();
-      void addFiles(files);
+      if (files.length > 0) {
+        void pasteFiles(files);
+      } else {
+        void pasteAppClipboardPayload();
+      }
       return;
     }
     if (isTyping()) {
@@ -1976,7 +2030,7 @@ export default function App() {
     if (clip.kind === 'text') {
       return canWriteTextClipboard();
     }
-    if (clip.kind === 'image') {
+    if (clip.kind === 'image' || clip.kind === 'file') {
       return canWriteImageClipboard();
     }
     return false;
@@ -2527,6 +2581,17 @@ function isCompleteTextPreview(clip: ClipEntry) {
   return clip.kind === 'text' && clip.size <= textEncoder.encode(clip.preview || '').byteLength;
 }
 
+function clipboardContainsAppPayload(data: DataTransfer | null | undefined) {
+  if (!data) {
+    return false;
+  }
+  return [...data.types].some((type) => isAppClipboardPayloadType(type));
+}
+
+function isAppClipboardPayloadType(type: string) {
+  return type === appClipboardPayloadClipboardType || type === appClipboardPayloadBlobMime;
+}
+
 function normalizePastedFile(file: File, itemMime = ''): File {
   if (file.name) {
     return file;
@@ -2579,14 +2644,156 @@ function requireClipboardAccess(): Clipboard & {
   if (!navigator.clipboard) {
     throw new Error('当前浏览器未开放剪贴板能力，请使用 HTTPS 或 localhost 访问。');
   }
-  return navigator.clipboard as Clipboard & {
-    read?: () => Promise<ClipboardItem[]>;
-  };
+  return navigator.clipboard as RichClipboard;
 }
 
 async function sha256Base64Url(bytes: Uint8Array) {
   const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', bytesToArrayBuffer(bytes)));
   return bytesToBase64Url(hash);
+}
+
+async function tryReadAppClipboardInput(): Promise<PlainClipInput | null> {
+  const nav = navigator.clipboard as RichClipboard | undefined;
+  if (!nav || typeof nav.read !== 'function') {
+    return null;
+  }
+  try {
+    return await readAppClipboardInputFromItems(await nav.read());
+  } catch {
+    return null;
+  }
+}
+
+async function readAppClipboardInput(): Promise<PlainClipInput> {
+  const input = await tryReadAppClipboardInput();
+  if (!input) {
+    throw new Error('当前剪贴板不是本应用复制的数据。');
+  }
+  return input;
+}
+
+async function readAppClipboardInputFromItems(items: ClipboardItem[]): Promise<PlainClipInput | null> {
+  for (const item of items) {
+    const type = item.types.find((value) => isAppClipboardPayloadType(value));
+    if (!type) {
+      continue;
+    }
+    try {
+      const payload = await item.getType(type);
+      const input = await readAppClipboardPayload(payload);
+      if (input) {
+        return input;
+      }
+    } catch {
+      // Ignore unreadable custom formats and fall back to the browser-provided data.
+    }
+  }
+  return null;
+}
+
+async function readAppClipboardPayload(payload: Blob): Promise<PlainClipInput | null> {
+  const bytes = new Uint8Array(await payload.arrayBuffer());
+  const magicLength = appClipboardPayloadMagicBytes.byteLength;
+  if (bytes.byteLength < magicLength + 4) {
+    return null;
+  }
+  for (let i = 0; i < magicLength; i += 1) {
+    if (bytes[i] !== appClipboardPayloadMagicBytes[i]) {
+      return null;
+    }
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const headerLength = view.getUint32(magicLength, false);
+  const headerStart = magicLength + 4;
+  const headerEnd = headerStart + headerLength;
+  if (headerEnd > bytes.byteLength) {
+    return null;
+  }
+  let header: Partial<AppClipboardPayloadHeader>;
+  try {
+    header = JSON.parse(textDecoder.decode(bytes.subarray(headerStart, headerEnd))) as Partial<AppClipboardPayloadHeader>;
+  } catch {
+    return null;
+  }
+  if (header.app !== 'openlist-clipboard' || header.version !== 1 || (header.kind !== 'image' && header.kind !== 'file')) {
+    return null;
+  }
+  const plain = bytes.subarray(headerEnd);
+  if (typeof header.size === 'number' && header.size !== plain.byteLength) {
+    return null;
+  }
+  const name = typeof header.name === 'string' && header.name ? header.name : header.kind === 'image' ? '图片' : '文件';
+  const mime = typeof header.mime === 'string' && header.mime ? header.mime : header.kind === 'image' ? 'image/png' : 'application/octet-stream';
+  const contentHash = await sha256Base64Url(plain);
+  return {
+    source: { bytes: plain.slice() },
+    size: plain.byteLength,
+    kind: header.kind,
+    name,
+    mime,
+    preview: header.kind === 'image' ? '图片' : '文件',
+    contentHash
+  };
+}
+
+async function buildAppClipboardPayload(clip: ClipEntry, plain: Uint8Array, contentHash: string): Promise<Blob> {
+  const header: AppClipboardPayloadHeader = {
+    app: 'openlist-clipboard',
+    version: 1,
+    kind: clip.kind === 'image' ? 'image' : 'file',
+    name: clip.name || (clip.kind === 'image' ? '图片' : '文件'),
+    mime: clip.mime || (clip.kind === 'image' ? 'image/png' : 'application/octet-stream'),
+    size: plain.byteLength,
+    contentHash
+  };
+  const headerBytes = textEncoder.encode(JSON.stringify(header));
+  const framed = new Uint8Array(appClipboardPayloadMagicBytes.byteLength + 4 + headerBytes.byteLength + plain.byteLength);
+  framed.set(appClipboardPayloadMagicBytes, 0);
+  new DataView(framed.buffer).setUint32(appClipboardPayloadMagicBytes.byteLength, headerBytes.byteLength, false);
+  framed.set(headerBytes, appClipboardPayloadMagicBytes.byteLength + 4);
+  framed.set(plain, appClipboardPayloadMagicBytes.byteLength + 4 + headerBytes.byteLength);
+  return new Blob([bytesToArrayBuffer(framed)], { type: appClipboardPayloadBlobMime });
+}
+
+async function writeBinaryClipToClipboard(
+  nav: RichClipboard,
+  clip: ClipEntry,
+  plain: Uint8Array,
+  contentHash: string
+): Promise<'exact' | 'fallback'> {
+  if (typeof nav.write !== 'function' || typeof ClipboardItem === 'undefined') {
+    throw new Error(clip.kind === 'image' ? '当前浏览器不支持复制图片到系统剪贴板。' : '当前浏览器不支持复制文件到系统剪贴板。');
+  }
+  const binaryMime = clip.mime || (clip.kind === 'image' ? 'image/png' : 'application/octet-stream');
+  const binaryBlob = new Blob([bytesToArrayBuffer(plain)], { type: binaryMime });
+  const payloadBlob = await buildAppClipboardPayload(clip, plain, contentHash);
+  try {
+    if (clip.kind === 'image') {
+      await nav.write([
+        new ClipboardItem({
+          [appClipboardPayloadClipboardType]: payloadBlob,
+          [binaryMime]: binaryBlob
+        })
+      ]);
+    } else {
+      await nav.write([
+        new ClipboardItem({
+          [appClipboardPayloadClipboardType]: payloadBlob
+        })
+      ]);
+    }
+    return 'exact';
+  } catch (err) {
+    if (clip.kind === 'image') {
+      try {
+        await nav.write([new ClipboardItem({ [binaryMime]: binaryBlob })]);
+        return 'fallback';
+      } catch (fallbackErr) {
+        throw new Error(`复制图片失败：${displayError(fallbackErr)}`);
+      }
+    }
+    throw new Error(`复制文件失败：${displayError(err)}`);
+  }
 }
 
 function imageExtension(mime: string) {
