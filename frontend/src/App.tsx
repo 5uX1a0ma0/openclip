@@ -42,10 +42,13 @@ import {
 } from './api';
 import {
   type CachedEncryptedChunk,
+  createEncryptedClipCache,
   encryptedCacheKey,
+  readEncryptedClipCacheChunk,
   readEncryptedClipCache,
-  writeEncryptedClipCache
+  writeEncryptedClipCacheChunk
 } from './blob_cache';
+import { runOrderedChunkPipeline } from './chunk_pipeline';
 import {
   base64UrlToBytes,
   bytesToArrayBuffer,
@@ -72,7 +75,7 @@ import {
   upsertGroup
 } from './groups';
 import { decodeQRCodeFromCanvas, qrCodeDataURL } from './qr';
-import { Sha256 } from './sha256';
+import { closeSha256Worker, sha256BlobFast } from './sha256_worker_client';
 import type { ActiveGroup, ClipChunk, ClipEntry, ClipIndex, IndexEvent, RuntimeConfig, SavedGroup } from './types';
 
 const textEncoder = new TextEncoder();
@@ -348,6 +351,7 @@ export default function App() {
     closeUpdateNotification();
     stopInviteScanner();
     closeCryptoWorker();
+    closeSha256Worker();
     plainCache.clear();
     Object.values(previewUrls()).forEach(URL.revokeObjectURL);
     toastTimers.forEach((timer) => window.clearTimeout(timer));
@@ -890,20 +894,41 @@ export default function App() {
       };
     }
 
-    const cached = await readEncryptedClipCache(encryptedCacheKey(group.id, contentHash, input.size, chunkSize));
-    const chunkSetId = cached?.chunkSetId || randomCacheToken();
-    const encryptedChunks = cached?.chunks || (await encryptInputChunks(group, input, contentHash, chunkSize, chunkSetId));
-    const chunks: ClipChunk[] = [];
-    let encryptedSize = 0;
-    for (const cachedChunk of encryptedChunks) {
-      const uploaded = await guardRemoteOperation(group, () => uploadBlob(group, cachedChunk.encrypted));
-      chunks.push({
-        blobId: uploaded.clipId,
-        size: cachedChunk.plainSize,
-        encryptedSize: cachedChunk.encryptedSize
-      });
-      encryptedSize += cachedChunk.encryptedSize;
+    const cacheKey = encryptedCacheKey(group.id, contentHash, input.size, chunkSize);
+    const chunkCount = Math.ceil(input.size / chunkSize);
+    const cached = await readEncryptedClipCache(cacheKey);
+    const chunkSetId = cached?.chunkCount === chunkCount ? cached.chunkSetId : randomCacheToken();
+    await createEncryptedClipCache({
+      key: cacheKey,
+      groupId: group.id,
+      contentHash,
+      size: input.size,
+      chunkSize,
+      chunkSetId,
+      chunkCount
+    });
+    const uploadedBlobIds: string[] = [];
+    let chunks: ClipChunk[];
+    try {
+      chunks = await runOrderedChunkPipeline(
+        chunkCount,
+        chunkCryptoConcurrency(),
+        async (index) => prepareEncryptedChunk(group, input, cacheKey, chunkSetId, chunkSize, index),
+        async (cachedChunk) => {
+          const uploaded = await guardRemoteOperation(group, () => uploadBlob(group, cachedChunk.encrypted));
+          uploadedBlobIds.push(uploaded.clipId);
+          return {
+            blobId: uploaded.clipId,
+            size: cachedChunk.plainSize,
+            encryptedSize: cachedChunk.encryptedSize
+          };
+        }
+      );
+    } catch (error) {
+      await Promise.allSettled(uploadedBlobIds.map((blobId) => deleteBlob(group, blobId)));
+      throw error;
     }
+    const encryptedSize = chunks.reduce((sum, chunk) => sum + chunk.encryptedSize, 0);
     const first = chunks[0];
     if (!first) {
       throw new Error('分片上传没有生成任何内容。');
@@ -922,39 +947,38 @@ export default function App() {
     };
   }
 
-  async function encryptInputChunks(
+  async function prepareEncryptedChunk(
     group: ActiveGroup,
     input: PlainClipInput,
-    contentHash: string,
+    cacheKey: string,
+    chunkSetId: string,
     chunkSize: number,
-    chunkSetId: string
-  ): Promise<CachedEncryptedChunk[]> {
-    const jobs: Array<{ index: number; offset: number; size: number }> = [];
-    for (let offset = 0, index = 0; offset < input.size; offset += chunkSize, index += 1) {
-      jobs.push({ index, offset, size: Math.min(chunkSize, input.size - offset) });
+    index: number
+  ): Promise<CachedEncryptedChunk> {
+    const offset = index * chunkSize;
+    const size = Math.min(chunkSize, input.size - offset);
+    const cached = await readEncryptedClipCacheChunk(cacheKey, index);
+    if (
+      cached &&
+      cached.index === index &&
+      cached.chunkSetId === chunkSetId &&
+      cached.plainSize === size &&
+      cached.encryptedSize === cached.encrypted.byteLength
+    ) {
+      return cached;
     }
-    const encryptedChunks = await mapConcurrent(jobs, chunkCryptoConcurrency(), async ({ index, offset, size }) => {
-      const plain = await readPlainInputChunk(input, offset, size);
-      const plainSize = plain.byteLength;
-      const encrypted = await encryptChunkBytesFast(group.vaultCryptoKey, plain, chunkAAD(chunkSetId, index, plainSize), { transfer: true });
-      return {
-        index,
-        plainSize,
-        encryptedSize: encrypted.byteLength,
-        encrypted
-      };
-    });
-    await writeEncryptedClipCache({
-      key: encryptedCacheKey(group.id, contentHash, input.size, chunkSize),
-      groupId: group.id,
-      contentHash,
-      size: input.size,
-      chunkSize,
+    const plain = await readPlainInputChunk(input, offset, size);
+    const plainSize = plain.byteLength;
+    const encrypted = await encryptChunkBytesFast(group.vaultCryptoKey, plain, chunkAAD(chunkSetId, index, plainSize), { transfer: true });
+    const prepared = {
+      index,
       chunkSetId,
-      chunks: encryptedChunks,
-      updatedAt: Date.now()
-    });
-    return encryptedChunks;
+      plainSize,
+      encryptedSize: encrypted.byteLength,
+      encrypted
+    };
+    await writeEncryptedClipCacheChunk(cacheKey, prepared);
+    return prepared;
   }
 
   async function saveOrPromoteClip(input: PlainClipInput): Promise<SaveOutcome> {
@@ -2432,29 +2456,7 @@ async function sha256Input(input: PlainClipInput): Promise<string> {
   if (!file) {
     throw new Error('没有可读取的内容。');
   }
-  const hasher = new Sha256();
-  if (file.stream) {
-    const reader = file.stream().getReader();
-    try {
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (done) {
-          break;
-        }
-        if (value) {
-          hasher.update(value);
-        }
-      }
-    } finally {
-      reader.releaseLock();
-    }
-  } else {
-    const chunkSize = defaultChunkPlainBytes;
-    for (let offset = 0; offset < file.size; offset += chunkSize) {
-      hasher.update(await readPlainInputChunk(input, offset, Math.min(chunkSize, file.size - offset)));
-    }
-  }
-  return bytesToBase64Url(hasher.digest());
+  return bytesToBase64Url(await sha256BlobFast(file));
 }
 
 function isChunkedClip(clip: ClipEntry): clip is ClipEntry & { chunkSetId: string; chunks: ClipChunk[] } {
