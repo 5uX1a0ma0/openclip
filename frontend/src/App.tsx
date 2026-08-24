@@ -3,13 +3,13 @@ import {
   Camera,
   Clipboard as ClipboardIcon,
   Copy,
+  CloudSync,
   Download,
   Eye,
   EyeOff,
   FileIcon,
   FileText,
   ImageIcon,
-  KeyRound,
   Loader2,
   LogOut,
   Maximize2,
@@ -18,9 +18,9 @@ import {
   Plus,
   QrCode,
   RefreshCw,
+  Send,
   Trash2,
   Upload,
-  Users,
   X
 } from 'lucide-solid';
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from 'solid-js';
@@ -110,6 +110,10 @@ type LiveState = 'offline' | 'connecting' | 'live';
 type IndexStream = { close: () => void };
 type SyncReason = 'enable' | 'focus' | 'visibility' | 'remote' | 'clipboardchange' | 'online';
 type NotificationSupportState = NotificationPermission | 'unsupported';
+type BeforeInstallPromptEvent = Event & {
+  prompt: () => Promise<void>;
+  userChoice: Promise<{ outcome: 'accepted' | 'dismissed'; platform: string }>;
+};
 type ToastKind = 'success' | 'error' | 'info';
 type ToastMessage = {
   id: number;
@@ -214,10 +218,13 @@ export default function App() {
   const [clipboardSyncEnabled, setClipboardSyncEnabled] = createSignal(false);
   const [clipboardNotifyEnabled, setClipboardNotifyEnabled] = createSignal(false);
   const [notificationPermission, setNotificationPermission] = createSignal<NotificationSupportState>(notificationPermissionState());
+  const [installPrompt, setInstallPrompt] = createSignal<BeforeInstallPromptEvent | null>(null);
+  const [serviceWorkerUpdateReady, setServiceWorkerUpdateReady] = createSignal(false);
 
   let scannerVideo: HTMLVideoElement | undefined;
   let scannerCanvas: HTMLCanvasElement | undefined;
-  let fileInput: HTMLInputElement | undefined;
+  let serviceWorkerRegistration: ServiceWorkerRegistration | null = null;
+  let reloadingForServiceWorker = false;
   let scannerStream: MediaStream | null = null;
   let scannerFrame = 0;
   let scannerDone = false;
@@ -308,6 +315,8 @@ export default function App() {
     window.addEventListener('focus', handleWindowFocus);
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
+    window.addEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
+    window.addEventListener('appinstalled', handleAppInstalled);
     document.addEventListener('visibilitychange', handleVisibilityChange);
     clipboardEventTarget()?.addEventListener('clipboardchange', handleClipboardChange);
     if (cryptoUnavailable) {
@@ -345,6 +354,9 @@ export default function App() {
     window.removeEventListener('focus', handleWindowFocus);
     window.removeEventListener('online', handleOnline);
     window.removeEventListener('offline', handleOffline);
+    window.removeEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
+    window.removeEventListener('appinstalled', handleAppInstalled);
+    navigator.serviceWorker?.removeEventListener('controllerchange', handleServiceWorkerControllerChange);
     document.removeEventListener('visibilitychange', handleVisibilityChange);
     clipboardEventTarget()?.removeEventListener('clipboardchange', handleClipboardChange);
     closeIndexEvents();
@@ -378,10 +390,69 @@ export default function App() {
       return null;
     }
     try {
-      return await navigator.serviceWorker.register('/sw.js');
+      const registration = await navigator.serviceWorker.register('/sw.js');
+      serviceWorkerRegistration = registration;
+      watchServiceWorkerRegistration(registration);
+      navigator.serviceWorker.addEventListener('controllerchange', handleServiceWorkerControllerChange);
+      return registration;
     } catch {
       return null;
     }
+  }
+
+  function watchServiceWorkerRegistration(registration: ServiceWorkerRegistration) {
+    if (registration.waiting) {
+      setServiceWorkerUpdateReady(true);
+    }
+    registration.addEventListener('updatefound', () => {
+      const worker = registration.installing;
+      if (!worker) {
+        return;
+      }
+      worker.addEventListener('statechange', () => {
+        if (worker.state === 'installed' && navigator.serviceWorker.controller) {
+          setServiceWorkerUpdateReady(true);
+        }
+      });
+    });
+  }
+
+  function handleBeforeInstallPrompt(event: Event) {
+    event.preventDefault();
+    if (!isStandaloneWebApp()) {
+      setInstallPrompt(event as BeforeInstallPromptEvent);
+    }
+  }
+
+  function handleAppInstalled() {
+    setInstallPrompt(null);
+  }
+
+  async function installApp() {
+    const prompt = installPrompt();
+    if (!prompt) {
+      return;
+    }
+    setInstallPrompt(null);
+    await prompt.prompt();
+    await prompt.userChoice;
+  }
+
+  function applyServiceWorkerUpdate() {
+    const worker = serviceWorkerRegistration?.waiting;
+    if (!worker) {
+      setServiceWorkerUpdateReady(false);
+      return;
+    }
+    worker.postMessage({ type: 'SKIP_WAITING' });
+  }
+
+  function handleServiceWorkerControllerChange() {
+    if (reloadingForServiceWorker) {
+      return;
+    }
+    reloadingForServiceWorker = true;
+    window.location.reload();
   }
 
   async function createGroupAction(event: Event) {
@@ -854,17 +925,20 @@ export default function App() {
     });
   }
 
-  function openFilePicker() {
-    if (busy() || !unlocked()) {
-      return;
-    }
-    fileInput?.click();
-  }
-
   function handleFileInputChange(input: HTMLInputElement) {
     const files = [...(input.files || [])];
     input.value = '';
     void addFiles(files);
+  }
+
+  function handleComposerKeyDown(event: KeyboardEvent) {
+    if (event.key !== 'Enter' || (!event.ctrlKey && !event.metaKey)) {
+      return;
+    }
+    event.preventDefault();
+    if (!busy() && textDraft().trim()) {
+      void addText();
+    }
   }
 
   async function addPlainBytes(input: PlainClipInput): Promise<SaveOutcome> {
@@ -2062,62 +2136,67 @@ export default function App() {
 
   return (
     <main class="app">
-      <header class="topbar">
-        <div class="brand">
-          <div class="brand-mark"><Users size={18} /></div>
-          <div>
-            <h1>OpenList Clipboard</h1>
-            <span>{activeGroup() ? `${activeGroup()!.name} · ${activeClips().length} 条` : '未打开剪贴板'}</span>
-          </div>
-        </div>
-        <div class="top-actions">
-          <Show when={groups().length > 0}>
-            <select class="group-select" value={activeGroup()?.id || ''} disabled={busy()} onChange={(event) => void switchGroup(event.currentTarget.value)}>
-              <option value="" disabled>选择剪贴板</option>
-              <For each={groups()}>{(group) => <option value={group.id}>{group.name}</option>}</For>
-            </select>
-          </Show>
-          <Show when={unlocked()}>
+      <Show when={unlocked()}>
+        <section class="workspace-toolbar" aria-label="剪贴板工具栏">
+          <select class="group-select" value={activeGroup()?.id || ''} disabled={busy()} aria-label="选择剪贴板" onChange={(event) => void switchGroup(event.currentTarget.value)}>
+            <For each={groups()}>{(group) => <option value={group.id}>{group.name}</option>}</For>
+          </select>
+          <span class={`live-indicator ${liveState()}`} title={liveStateLabel(liveState())} aria-label={liveStateLabel(liveState())} />
+          <div class="toolbar-actions">
             <button class="icon-button" title="读取剪贴板" disabled={busy()} onClick={() => void readClipboard()}>
               <ClipboardIcon size={18} />
             </button>
-            <button class="icon-button" title="刷新/重连" disabled={busy()} onClick={() => void refreshAndReconnect()}>
-              <RefreshCw size={18} />
+            <button class="icon-button" title="刷新" disabled={busy()} onClick={() => void refreshAndReconnect()}>
+              <CloudSync size={18} />
             </button>
-            <label class={`sync-toggle ${clipboardSyncEnabled() ? 'enabled' : ''}`} title="前台剪贴板同步">
+            <label class={`icon-toggle ${clipboardSyncEnabled() ? 'enabled' : ''}`} title="同步">
               <input
                 type="checkbox"
-                aria-label="前台剪贴板同步"
+                aria-label="同步"
                 checked={clipboardSyncEnabled()}
                 onChange={(event) => toggleClipboardSync(event.currentTarget.checked)}
               />
-              <span class="sync-switch" />
-              <span>同步</span>
+              <RefreshCw size={18} />
             </label>
-            <label class={`sync-toggle notification-toggle ${clipboardNotifyEnabled() ? 'enabled' : ''}`} title={notificationToggleTitle()}>
+            <label class={`icon-toggle ${clipboardNotifyEnabled() ? 'enabled' : ''}`} title={notificationToggleTitle()}>
               <input
                 type="checkbox"
-                aria-label="远端更新通知"
+                aria-label="通知"
                 checked={clipboardNotifyEnabled()}
                 onChange={(event) => void toggleClipboardNotification(event.currentTarget.checked)}
               />
-              <span class="sync-switch" />
-              <Bell size={14} />
-              <span>通知</span>
+              <Bell size={18} />
             </label>
-            <span class={`live-pill ${liveState()}`}>{liveStateLabel(liveState())}</span>
             <Show when={busy() || syncing()}>
-              <span class="busy-pill">
-                <Loader2 class="spin" size={14} />
-                {busy() ? operationLabel() || '处理中' : '同步中'}
+              <span class="busy-indicator" title={busy() ? operationLabel() || '处理中' : '同步中'}>
+                <Loader2 class="spin" size={18} />
               </span>
+            </Show>
+            <button class="icon-button" title="复制密钥" disabled={busy()} onClick={() => void copyInviteKey()}>
+              <Copy size={17} />
+            </button>
+            <button class="icon-button" title="密钥二维码" onClick={() => void showInviteCodeQR()}>
+              <QrCode size={17} />
+            </button>
+            <button class="icon-button danger" title="忘记密钥" onClick={removeActiveGroup}>
+              <Trash2 size={17} />
+            </button>
+            <Show when={installPrompt()}>
+              <button class="icon-button" title="安装应用" onClick={() => void installApp()}>
+                <Download size={18} />
+              </button>
+            </Show>
+            <Show when={serviceWorkerUpdateReady()}>
+              <button class="icon-button update-ready" title="更新应用" onClick={applyServiceWorkerUpdate}>
+                <RefreshCw size={18} />
+              </button>
             </Show>
             <button class="icon-button" title="关闭当前剪贴板" disabled={busy()} onClick={leaveGroup}>
               <LogOut size={18} />
             </button>
-          </Show>
-        </div>
-      </header>
+          </div>
+        </section>
+      </Show>
 
       <Show when={persistentNotice()}>
         <div class={`status-strip ${persistentNotice()!.kind}`}>{persistentNotice()!.message}</div>
@@ -2125,10 +2204,6 @@ export default function App() {
 
       <Show when={!unlocked()}>
         <section class="key-panel">
-          <div class="panel-title">
-            <KeyRound size={18} />
-            <h2>剪贴板</h2>
-          </div>
           <Show when={cryptoUnavailable}>
             <p class="notice">{cryptoUnavailable}</p>
           </Show>
@@ -2185,40 +2260,27 @@ export default function App() {
           <textarea
             value={textDraft()}
             onInput={(event) => setTextDraft(event.currentTarget.value)}
+            onKeyDown={handleComposerKeyDown}
             placeholder="粘贴文本"
             rows={4}
           />
           <div class="composer-actions">
-            <button class="file-button" type="button" title="上传文件" disabled={busy()} onClick={openFilePicker}>
+            <label class={`file-button icon-button ${busy() ? 'disabled' : ''}`} title="选择文件">
               <Upload size={17} />
-              文件
-            </button>
-            <input
-              ref={(el) => (fileInput = el)}
-              class="file-input"
-              type="file"
-              multiple
-              tabindex={-1}
-              onChange={(event) => handleFileInputChange(event.currentTarget)}
-            />
-            <button onClick={() => void addText()} disabled={busy() || textDraft().trim().length === 0}>
-              <FileText size={17} />
-              保存
+              <input
+                class="file-input"
+                type="file"
+                accept="*/*"
+                multiple
+                disabled={busy()}
+                aria-label="选择文件"
+                onChange={(event) => handleFileInputChange(event.currentTarget)}
+              />
+            </label>
+            <button class="icon-button send-button" title="发送" aria-label="发送" onClick={() => void addText()} disabled={busy() || textDraft().trim().length === 0}>
+              <Send size={18} />
             </button>
           </div>
-        </section>
-
-        <section class="vault-strip">
-          <span class="mono">{activeGroup()?.invite}</span>
-          <button class="icon-button" title="复制剪贴板密钥" disabled={busy()} onClick={() => void copyInviteKey()}>
-            <Copy size={17} />
-          </button>
-          <button class="icon-button" title="生成剪贴板密钥二维码" onClick={() => void showInviteCodeQR()}>
-            <QrCode size={17} />
-          </button>
-          <button class="icon-button danger" title="忘记本机密钥" onClick={removeActiveGroup}>
-            <Trash2 size={17} />
-          </button>
         </section>
 
         <section class="clip-list">
@@ -2239,7 +2301,10 @@ export default function App() {
                       <Show when={clip.kind !== 'text'}>
                         <strong>{clip.name}</strong>
                       </Show>
-                      <span>{formatSize(clip.size)} · {formatTime(clipSortTime(clip))}</span>
+                      <span class="clip-meta">
+                        <span>{formatSize(clip.size)}</span>
+                        <time>{formatTime(clipSortTime(clip))}</time>
+                      </span>
                     </div>
                     <Show when={clip.kind === 'text'}>
                       <Show when={!textPreviewState()[clip.id]?.text}>
@@ -2325,7 +2390,6 @@ export default function App() {
                 <X size={17} />
               </button>
             </div>
-            <p class="notice">剪贴板密钥包含完整访问权限，只分享给可信设备。</p>
             <Show when={inviteQR()}>
               <img class="qr-image" src={inviteQR()} alt="剪贴板密钥二维码" />
             </Show>
@@ -2358,7 +2422,6 @@ export default function App() {
               }
             >
               <div class="scanner-result">
-                <p class="notice info">已识别剪贴板密钥，请确认后加入。</p>
                 <div class="scanner-key mono">{scannedInvite()}</div>
                 <div class="qr-actions">
                   <button type="button" disabled={busy()} onClick={() => void joinScannedInvite()}>

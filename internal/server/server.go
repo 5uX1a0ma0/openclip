@@ -489,10 +489,6 @@ func (a *API) verifyRequest(r *http.Request, bodyHashHex string, groupID string,
 	if err != nil || !timestampAllowed(parsedTimestamp, time.Now()) {
 		return false
 	}
-	if !a.nonces.Allow(groupID, nonce, time.Now()) {
-		return false
-	}
-
 	canonical := strings.Join([]string{
 		r.Method,
 		r.URL.EscapedPath(),
@@ -508,7 +504,7 @@ func (a *API) verifyRequest(r *http.Request, bodyHashHex string, groupID string,
 	digest := sha256.Sum256([]byte(canonical))
 	rValue := new(big.Int).SetBytes(sig[:32])
 	sValue := new(big.Int).SetBytes(sig[32:])
-	return ecdsa.Verify(publicKey, digest[:], rValue, sValue)
+	return ecdsa.Verify(publicKey, digest[:], rValue, sValue) && a.nonces.Allow(groupID, nonce, time.Now())
 }
 
 func (a *API) securityHeaders(next http.Handler) http.Handler {
@@ -516,7 +512,15 @@ func (a *API) securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Permissions-Policy", "camera=(self), microphone=(), geolocation=()")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'")
+		w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
+		w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self'; img-src 'self' blob: data:; connect-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'")
+		if r.TLS != nil {
+			w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			w.Header().Set("Cache-Control", "no-store")
+		}
 		next.ServeHTTP(w, r)
 	})
 }
@@ -558,6 +562,7 @@ func (a *API) static(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.HasPrefix(r.URL.Path, "/assets/") {
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 		http.StripPrefix("/assets", http.FileServer(http.Dir(filepath.Join(a.cfg.StaticDir, "assets")))).ServeHTTP(w, r)
 		return
 	}
@@ -565,10 +570,14 @@ func (a *API) static(w http.ResponseWriter, r *http.Request) {
 	if rel != "." && rel != "" {
 		staticPath := filepath.Join(a.cfg.StaticDir, rel)
 		if info, err := os.Stat(staticPath); err == nil && !info.IsDir() {
+			if rel == "sw.js" || rel == "manifest.webmanifest" {
+				w.Header().Set("Cache-Control", "no-cache")
+			}
 			http.ServeFile(w, r, staticPath)
 			return
 		}
 	}
+	w.Header().Set("Cache-Control", "no-cache")
 	http.ServeFile(w, r, indexPath)
 }
 

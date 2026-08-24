@@ -133,6 +133,28 @@ func TestRejectUnsignedInvalidReplayAndOversize(t *testing.T) {
 	}
 }
 
+func TestInvalidSignatureDoesNotConsumeNonce(t *testing.T) {
+	handler, _ := testServer()
+	group := newTestGroup(t, 1)
+	createGroup(t, handler, group, http.StatusCreated)
+
+	const nonce = "valid-after-invalid-signature"
+	invalid := signedRequest(t, http.MethodGet, "/api/v1/groups/"+group.id+"/index", nil, group, nonce)
+	invalid.Header.Set("X-Request-Signature", strings.Repeat("A", 86))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, invalid)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("invalid signature status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	valid := signedRequest(t, http.MethodGet, "/api/v1/groups/"+group.id+"/index", nil, group, nonce)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, valid)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("valid request status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestBlobRoundTrip(t *testing.T) {
 	handler, _ := testServer()
 	group := newTestGroup(t, 1)
@@ -196,6 +218,41 @@ func TestStaticServesServiceWorkerFile(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK || rec.Body.String() != "worker" {
 		t.Fatalf("sw.js status=%d body=%q", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-cache" {
+		t.Fatalf("sw.js Cache-Control=%q", got)
+	}
+}
+
+func TestSecurityAndCacheHeaders(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(dir+"/assets", 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/index.html", []byte("index"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/assets/app.js", []byte("app"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	handler := New(Config{MaxBlobBytes: 1024, StaticDir: dir}, newMemoryStore())
+
+	asset := httptest.NewRecorder()
+	handler.ServeHTTP(asset, httptest.NewRequest(http.MethodGet, "/assets/app.js", nil))
+	if got := asset.Header().Get("Cache-Control"); got != "public, max-age=31536000, immutable" {
+		t.Fatalf("asset Cache-Control=%q", got)
+	}
+	if got := asset.Header().Get("Cross-Origin-Opener-Policy"); got != "same-origin" {
+		t.Fatalf("COOP=%q", got)
+	}
+	if got := asset.Header().Get("Content-Security-Policy"); !strings.Contains(got, "form-action 'self'") || strings.Contains(got, "unsafe-inline") {
+		t.Fatalf("CSP=%q", got)
+	}
+
+	api := httptest.NewRecorder()
+	handler.ServeHTTP(api, httptest.NewRequest(http.MethodGet, "/api/health", nil))
+	if got := api.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("API Cache-Control=%q", got)
 	}
 }
 
