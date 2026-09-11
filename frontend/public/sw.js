@@ -6,7 +6,8 @@ self.addEventListener('activate', (event) => {
   event.waitUntil(
     Promise.all([
       removeOldCaches(),
-      self.clients.claim()
+      self.clients.claim(),
+      isWindows() ? clearLegacyBadge() : Promise.resolve()
     ])
   );
 });
@@ -41,7 +42,7 @@ self.addEventListener('push', (event) => {
   const body = textValue(payload.body, '剪贴板内容已更新');
   const targetUrl = notificationTargetUrl(payload);
   try {
-    if (self.navigator?.setAppBadge) {
+    if (!isWindows() && self.navigator?.setAppBadge) {
       event.waitUntil(self.navigator.setAppBadge(1).catch(() => undefined));
     }
   } catch {
@@ -63,7 +64,20 @@ self.addEventListener('push', (event) => {
   );
 });
 
-const cacheName = 'openclip-shell-v2';
+function isWindows() {
+  const nav = self.navigator;
+  return /Windows|Win32|Win64|WinCE/i.test(`${nav?.userAgentData?.platform || ''} ${nav?.platform || ''} ${nav?.userAgent || ''}`);
+}
+
+async function clearLegacyBadge() {
+  try {
+    await self.navigator?.clearAppBadge?.();
+  } catch {
+    // Old Windows app badges must not interfere with system notification counts.
+  }
+}
+
+const cacheName = 'openclip-shell-v3';
 const shellFiles = [
   '/',
   '/manifest.webmanifest',

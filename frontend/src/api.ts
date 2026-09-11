@@ -4,7 +4,7 @@ import { bytesToArrayBuffer, bytesToBase64Url } from './crypto';
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
-export const remoteClipboardUnavailableMessage = '远端剪贴板不存在或密钥已失效，请刷新、切换或忘记本机记录后重新加入。';
+export const remoteClipboardUnavailableMessage = '远端剪贴板不存在或密钥已失效，请重新打开、切换或忘记本机记录后重新加入。';
 
 export class ApiError extends Error {
   readonly status: number;

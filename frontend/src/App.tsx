@@ -3,7 +3,6 @@ import {
   Camera,
   Clipboard as ClipboardIcon,
   Copy,
-  CloudSync,
   Download,
   Eye,
   EyeOff,
@@ -11,7 +10,6 @@ import {
   FileText,
   ImageIcon,
   Loader2,
-  LogOut,
   Maximize2,
   Pin,
   PinOff,
@@ -19,6 +17,8 @@ import {
   QrCode,
   RefreshCw,
   Send,
+  ToggleLeft,
+  ToggleRight,
   Trash2,
   Upload,
   X
@@ -48,6 +48,17 @@ import {
   readEncryptedClipCache,
   writeEncryptedClipCacheChunk
 } from './blob_cache';
+import {
+  type PlainClipInput,
+  type RichClipboard,
+  clipboardContainsAppPayload,
+  clipboardFilesFromPaste,
+  readAppClipboardInput,
+  readSystemClipboardInput,
+  tryReadAppClipboardInput,
+  writeBinaryClipToClipboard
+} from './clipboard';
+import { clearAppBadge, setAppBadge, clearLegacySyncStorage } from './platform';
 import { runOrderedChunkPipeline } from './chunk_pipeline';
 import {
   base64UrlToBytes,
@@ -89,8 +100,6 @@ const defaultChunkPlainBytes = 4 * 1024 * 1024;
 const chunkedEncryption = 'aes-gcm-chunked-v1';
 const cryptoUnavailable = webCryptoUnavailableReason();
 const notificationEnabledStorageKey = 'openlist-clipboard.notify.enabled.v1';
-const syncEnabledStorageKey = 'openlist-clipboard.sync.enabled.v1';
-const syncStateStorageKey = 'openlist-clipboard.sync.state.v1';
 const clientIdStorageKey = 'openlist-clipboard.client-id.v1';
 const scannerMaxEdge = 640;
 const scannerScanIntervalMs = 120;
@@ -101,14 +110,8 @@ const maxPlainCacheBytes = 8 * 1024 * 1024;
 const maxChunkCryptoConcurrency = 3;
 const notificationTitle = 'OpenList Clipboard';
 const updateNotificationBody = '剪贴板内容已更新';
-const appClipboardPayloadBlobMime = 'application/vnd.openlist-clipboard.clip';
-const appClipboardPayloadClipboardType = `web ${appClipboardPayloadBlobMime}`;
-const appClipboardPayloadMagic = 'OLC_CLIP_V1\n';
-const appClipboardPayloadMagicBytes = new TextEncoder().encode(appClipboardPayloadMagic);
-
 type LiveState = 'offline' | 'connecting' | 'live';
 type IndexStream = { close: () => void };
-type SyncReason = 'enable' | 'focus' | 'visibility' | 'remote' | 'clipboardchange' | 'online';
 type NotificationSupportState = NotificationPermission | 'unsupported';
 type BeforeInstallPromptEvent = Event & {
   prompt: () => Promise<void>;
@@ -124,27 +127,6 @@ type PersistentNotice = {
   kind: 'info' | 'error';
   message: string;
 };
-type ClipboardSnapshot = {
-  kind: ClipEntry['kind'];
-  bytes: Uint8Array;
-  name: string;
-  mime: string;
-  preview: string;
-  hash: string;
-};
-type PlainSource = {
-  bytes?: Uint8Array;
-  file?: File;
-};
-type PlainClipInput = {
-  source: PlainSource;
-  size: number;
-  kind: ClipEntry['kind'];
-  name: string;
-  mime: string;
-  preview: string;
-  contentHash?: string;
-};
 type SaveOutcome = {
   clip: ClipEntry;
   contentHash: string;
@@ -159,32 +141,11 @@ type UploadedEncryptedInput = {
   chunkSize?: number;
   chunks?: ClipChunk[];
 };
-type StoredSyncState = {
-  localHash?: string;
-  localObservedAt?: number;
-  remoteClipId?: string;
-  remoteHash?: string;
-  remoteCopiedAt?: number;
-};
 type ExpandedTextState = {
   loading?: boolean;
   text?: string;
   error?: string;
 };
-type RichClipboard = Clipboard & {
-  read?: () => Promise<ClipboardItem[]>;
-  write?: (items: ClipboardItem[]) => Promise<void>;
-};
-type AppClipboardPayloadHeader = {
-  app: 'openlist-clipboard';
-  version: 1;
-  kind: 'image' | 'file';
-  name: string;
-  mime: string;
-  size: number;
-  contentHash?: string;
-};
-
 const clientId = loadClientId();
 
 export default function App() {
@@ -197,7 +158,6 @@ export default function App() {
   const [baseHash, setBaseHash] = createSignal('');
   const [textDraft, setTextDraft] = createSignal('');
   const [busy, setBusy] = createSignal(false);
-  const [syncing, setSyncing] = createSignal(false);
   const [operationLabel, setOperationLabel] = createSignal('');
   const [persistentNotice, setPersistentNotice] = createSignal<PersistentNotice | null>(null);
   const [toasts, setToasts] = createSignal<ToastMessage[]>([]);
@@ -215,7 +175,6 @@ export default function App() {
   const [scannerOpen, setScannerOpen] = createSignal(false);
   const [scannedInvite, setScannedInvite] = createSignal('');
   const [liveState, setLiveState] = createSignal<LiveState>('offline');
-  const [clipboardSyncEnabled, setClipboardSyncEnabled] = createSignal(false);
   const [clipboardNotifyEnabled, setClipboardNotifyEnabled] = createSignal(false);
   const [notificationPermission, setNotificationPermission] = createSignal<NotificationSupportState>(notificationPermissionState());
   const [installPrompt, setInstallPrompt] = createSignal<BeforeInstallPromptEvent | null>(null);
@@ -234,8 +193,6 @@ export default function App() {
   let reconnectBlockedGroupID = '';
   let liveRefreshRunning = false;
   let queuedIndexHash = '';
-  let clipboardSyncRunning = false;
-  let queuedClipboardSyncReason: SyncReason | null = null;
   let activeUpdateNotification: Notification | null = null;
   let lastNotifiedGroupID = '';
   let lastNotifiedIndexHash = '';
@@ -309,6 +266,8 @@ export default function App() {
   onMount(async () => {
     void loadRuntimeConfig();
     void registerServiceWorker();
+    clearLegacySyncStorage();
+    void clearAppBadge();
     window.addEventListener('paste', handlePaste);
     window.addEventListener('dragover', preventDefault);
     window.addEventListener('drop', handleDrop);
@@ -318,7 +277,6 @@ export default function App() {
     window.addEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
     window.addEventListener('appinstalled', handleAppInstalled);
     document.addEventListener('visibilitychange', handleVisibilityChange);
-    clipboardEventTarget()?.addEventListener('clipboardchange', handleClipboardChange);
     if (cryptoUnavailable) {
       setPersistentNotice({ kind: 'error', message: cryptoUnavailable });
     }
@@ -358,7 +316,6 @@ export default function App() {
     window.removeEventListener('appinstalled', handleAppInstalled);
     navigator.serviceWorker?.removeEventListener('controllerchange', handleServiceWorkerControllerChange);
     document.removeEventListener('visibilitychange', handleVisibilityChange);
-    clipboardEventTarget()?.removeEventListener('clipboardchange', handleClipboardChange);
     closeIndexEvents();
     closeUpdateNotification();
     stopInviteScanner();
@@ -496,13 +453,11 @@ export default function App() {
     clearPreviewUrls();
     clearExpandedText();
     plainCache.clear();
-    clearQueuedClipboardSync();
     closeUpdateNotification();
     reconnectBlockedGroupID = '';
     lastNotifiedGroupID = '';
     lastNotifiedIndexHash = '';
     setActiveGroup(opened);
-    setClipboardSyncEnabled(loadSyncEnabled(opened.id));
     setClipboardNotifyEnabled(loadNotificationEnabled(opened.id));
     setNotificationPermission(notificationPermissionState());
     saveActiveGroupId(opened.id);
@@ -513,7 +468,6 @@ export default function App() {
     if (loadNotificationEnabled(opened.id) && webPushAvailability().available) {
       void ensurePushSubscription(opened);
     }
-    requestClipboardSync('focus');
   }
 
   function leaveGroup() {
@@ -521,13 +475,11 @@ export default function App() {
     clearPreviewUrls();
     clearExpandedText();
     plainCache.clear();
-    clearQueuedClipboardSync();
     closeUpdateNotification();
     reconnectBlockedGroupID = '';
     lastNotifiedGroupID = '';
     lastNotifiedIndexHash = '';
     setActiveGroup(null);
-    setClipboardSyncEnabled(false);
     setClipboardNotifyEnabled(false);
     saveActiveGroupId('');
     setIndex(emptyIndex());
@@ -685,25 +637,10 @@ export default function App() {
     await refreshIndex(group, true);
   }
 
-  async function refreshAndReconnect() {
-    await run(async () => {
-      const group = requireGroup();
-      reconnectBlockedGroupID = '';
-      const changed = await refreshIndex(group, true);
-      if (liveState() !== 'live') {
-        connectIndexEvents(group);
-      }
-      if (clipboardSyncEnabled()) {
-        requestClipboardSync('focus');
-      }
-      void clearAppBadge();
-      return changed ? '已刷新并更新列表' : '已刷新，内容已是最新';
-    }, '已刷新', '刷新中');
-  }
-
   async function refreshIndex(group: ActiveGroup, forceCleanup = false): Promise<boolean> {
     try {
       const response = await fetchIndex(group);
+      if (activeGroup()?.id !== group.id) return false;
       if (response.hash === baseHash()) {
         if (forceCleanup) {
           await cleanupExpired(index(), group, response.hash);
@@ -711,6 +648,7 @@ export default function App() {
         return false;
       }
       const decrypted = await decryptIndex(group.vaultCryptoKey, response.blob);
+      if (activeGroup()?.id !== group.id) return false;
       setBaseHash(response.hash);
       setIndex(decrypted);
       await cleanupExpired(decrypted, group, response.hash);
@@ -797,7 +735,6 @@ export default function App() {
         }
         if (changed) {
           notifyRemoteClipboardUpdated(group);
-          requestClipboardSync('remote');
         }
       } catch (err) {
         if (version === indexEventsVersion) {
@@ -879,7 +816,7 @@ export default function App() {
 
   async function pasteFiles(files: File[]) {
     await run(async () => {
-      const appInput = await tryReadAppClipboardInput();
+      const appInput = await tryReadAppClipboardInput(files);
       if (appInput) {
         const outcome = await addPlainBytes(appInput);
         return saveOutcomeMessage(outcome, '已粘贴');
@@ -1154,90 +1091,24 @@ export default function App() {
 
   async function readClipboard() {
     await run(async () => {
-      const nav = requireClipboardAccess();
-      const appInput = await tryReadAppClipboardInput();
-      if (appInput) {
-        const outcome = await addPlainBytes(appInput);
-        return saveOutcomeMessage(outcome, '已读取');
-      }
-      if (typeof nav.read === 'function') {
-        const items = await nav.read();
-        for (const item of items) {
-          const imageType = item.types.find((type) => type.startsWith('image/'));
-          if (imageType) {
-            const blob = await item.getType(imageType);
-            const bytes = new Uint8Array(await blob.arrayBuffer());
-            const outcome = await addPlainBytes({
-              source: { bytes },
-              size: bytes.byteLength,
-              kind: 'image',
-              name: `clipboard-${Date.now()}.${imageExtension(imageType)}`,
-              mime: imageType,
-              preview: '图片'
-            });
-            return saveOutcomeMessage(outcome, '已读取');
-          }
-        }
-      }
-      if (typeof nav.readText !== 'function') {
-        throw new Error('当前浏览器不支持读取文本剪贴板。');
-      }
-      const text = await nav.readText();
-      if (text.trim()) {
-        const bytes = textEncoder.encode(text);
-        const outcome = await addPlainBytes({
-          source: { bytes },
-          size: bytes.byteLength,
-          kind: 'text',
-          name: '文本',
-          mime: 'text/plain;charset=utf-8',
-          preview: textPreview(text)
-        });
-        return saveOutcomeMessage(outcome, '已读取');
-      }
-      return '系统剪贴板为空';
-    }, '已读取', '读取中');
+      const input = await readSystemClipboardInput(requireClipboardAccess());
+      if (!input) return '系统剪贴板为空';
+      return saveOutcomeMessage(await addPlainBytes(input), '已粘贴');
+    }, '已粘贴', '读取中');
   }
 
   async function copyClip(clip: ClipEntry) {
     await run(async () => {
-      if (!canCopyClip(clip)) {
-        throw new Error(clip.kind === 'image' ? '当前浏览器不支持复制图片到系统剪贴板。' : '当前浏览器不支持复制文件到系统剪贴板。');
-      }
       const nav = requireClipboardAccess();
-      const plain = await plainBytes(clip);
       if (clip.kind === 'text') {
-        if (typeof nav.writeText !== 'function') {
-          throw new Error('当前浏览器不支持复制文本。');
-        }
-        await nav.writeText(textDecoder.decode(plain));
+        if (!nav.writeText) throw new Error('当前浏览器不支持复制文本。');
+        await nav.writeText(textDecoder.decode(await plainBytes(clip)));
         return;
       }
-      const contentHash = clip.contentHash || (await sha256Base64Url(plain));
-      const mode = await writeBinaryClipToClipboard(nav, clip, plain, contentHash);
-      return mode === 'exact' ? undefined : '已复制；当前浏览器未保留原始图片字节，跨剪贴板粘贴可能重新编码';
-    }, '已复制');
-  }
-
-  function toggleClipboardSync(enabled: boolean) {
-    const group = activeGroup();
-    if (!group) {
-      return;
-    }
-    if (enabled && (!navigator.clipboard || !canWriteTextClipboard())) {
-      showToast('当前浏览器未开放剪贴板写入能力，请使用 HTTPS 或 localhost 访问。', 'error');
-      return;
-    }
-    setClipboardSyncEnabled(enabled);
-    saveSyncEnabled(group.id, enabled);
-    clearQueuedClipboardSync();
-    if (enabled) {
-      showToast('剪贴板前台同步已开启', 'info');
-      requestClipboardSync('enable');
-    } else {
-      setPersistentNotice(null);
-      showToast('剪贴板前台同步已关闭', 'info');
-    }
+      const mode = await writeBinaryClipToClipboard(nav, clip, () => plainBytes(clip));
+      if (mode === 'app-only') return '已复制，可在本应用内直接粘贴剪贴板';
+      if (mode === 'native') return '已复制；浏览器未保留应用内精确回粘数据';
+    }, '已复制', '复制中');
   }
 
   async function toggleClipboardNotification(enabled: boolean) {
@@ -1374,7 +1245,9 @@ export default function App() {
       if (registration && typeof registration.showNotification === 'function') {
         await registration.showNotification(notificationTitle, {
           body: updateNotificationBody,
-          tag: `openlist-clipboard-update-${group.id}`,
+          tag: 'openlist-clipboard-update',
+          icon: '/icon-192.png',
+          badge: '/badge-96.png',
           renotify: true,
           data: { url: '/' }
         } as NotificationOptions & { renotify: boolean });
@@ -1386,7 +1259,9 @@ export default function App() {
     try {
       const notification = new Notification(notificationTitle, {
         body: updateNotificationBody,
-        tag: `openlist-clipboard-update-${group.id}`
+        tag: 'openlist-clipboard-update',
+          icon: '/icon-192.png',
+          badge: '/badge-96.png'
       });
       activeUpdateNotification = notification;
       notification.onclick = () => {
@@ -1424,17 +1299,17 @@ export default function App() {
   }
 
   function handleWindowFocus() {
-    recoverForeground('focus');
+    recoverForeground();
   }
 
   function handleVisibilityChange() {
     if (document.visibilityState === 'visible') {
-      recoverForeground('visibility');
+      recoverForeground();
     }
   }
 
   function handleOnline() {
-    recoverForeground('online');
+    recoverForeground();
   }
 
   function handleOffline() {
@@ -1446,29 +1321,21 @@ export default function App() {
     setPersistentNotice({ kind: 'error', message: '网络已离线，恢复后会重新连接' });
   }
 
-  function handleClipboardChange() {
-    requestClipboardSync('clipboardchange');
-  }
-
-  function recoverForeground(reason: SyncReason) {
+  function recoverForeground() {
     const group = activeGroup();
-    if (!group || cryptoUnavailable || !canAttemptForegroundSync()) {
+    if (!group || cryptoUnavailable || navigator.onLine === false) {
       return;
     }
     void clearAppBadge();
-    if (clipboardNotifyEnabled() && webPushAvailability().available && notificationPermissionState() === 'granted') {
-      void ensurePushSubscription(group);
-    }
     if (reconnectBlockedGroupID === group.id) {
       setPersistentNotice({ kind: 'error', message: remoteClipboardUnavailableMessage });
       return;
     }
+    if (clipboardNotifyEnabled() && webPushAvailability().available && notificationPermissionState() === 'granted') {
+      void ensurePushSubscription(group);
+    }
     if (liveState() !== 'live') {
       connectIndexEvents(group);
-    }
-    if (clipboardSyncEnabled()) {
-      requestClipboardSync(reason);
-      return;
     }
     if (liveState() !== 'live') {
       void refreshIndex(group)
@@ -1480,292 +1347,8 @@ export default function App() {
     }
   }
 
-  function requestClipboardSync(reason: SyncReason) {
-    const group = activeGroup();
-    if (!group || !clipboardSyncEnabled() || cryptoUnavailable || !canAttemptForegroundSync()) {
-      return;
-    }
-    if (reconnectBlockedGroupID === group.id) {
-      setPersistentNotice({ kind: 'error', message: remoteClipboardUnavailableMessage });
-      return;
-    }
-    if (clipboardSyncRunning) {
-      queuedClipboardSyncReason = reason;
-      return;
-    }
-    clipboardSyncRunning = true;
-    setSyncing(true);
-    const groupID = group.id;
-    void (async () => {
-      try {
-        await syncClipboardNow(reason, groupID);
-      } catch (err) {
-        if (activeGroup()?.id === groupID && clipboardSyncEnabled()) {
-          showToast(clipboardSyncOperationError(err), 'error');
-        }
-      } finally {
-        clipboardSyncRunning = false;
-        setSyncing(false);
-        const queued = queuedClipboardSyncReason;
-        queuedClipboardSyncReason = null;
-        if (queued && activeGroup()?.id === groupID && clipboardSyncEnabled()) {
-          requestClipboardSync(queued);
-        }
-      }
-    })();
-  }
-
-  function clearQueuedClipboardSync() {
-    queuedClipboardSyncReason = null;
-    setSyncing(false);
-  }
-
-  async function syncClipboardNow(reason: SyncReason, groupID: string) {
-    const group = activeGroup();
-    if (!group || group.id !== groupID) {
-      return;
-    }
-    if (reason !== 'remote') {
-      const changed = await refreshIndex(group);
-      if (changed) {
-        setPersistentNotice({ kind: 'info', message: '已刷新远端内容' });
-      }
-    }
-
-    const latest = activeClips()[0];
-    if (reason === 'remote') {
-      if (latest) {
-        await copyRemoteClipToClipboard(latest, groupID);
-      }
-      return;
-    }
-
-    const state = loadSyncState(groupID);
-    let snapshot: ClipboardSnapshot | null;
-    try {
-      snapshot = await readClipboardSnapshot();
-    } catch (err) {
-      if (latest) {
-        await copyRemoteClipToClipboard(latest, groupID);
-        return;
-      }
-      throw err;
-    }
-
-    if (snapshot) {
-      saveSyncState(groupID, {
-        ...state,
-        localHash: snapshot.hash,
-        localObservedAt: Date.now()
-      });
-    }
-
-    if (!latest) {
-      if (snapshot) {
-        await uploadClipboardSnapshot(snapshot, groupID);
-      }
-      return;
-    }
-
-    if (snapshot) {
-      const latestHash = await knownClipHash(latest);
-      if (latestHash && snapshot.hash === latestHash) {
-        saveSyncState(groupID, {
-          ...state,
-          localHash: snapshot.hash,
-          localObservedAt: Date.now(),
-          remoteClipId: latest.id,
-          remoteHash: latestHash
-        });
-        setPersistentNotice({ kind: 'info', message: '剪贴板内容已是最新' });
-        return;
-      }
-
-      const localChanged = !!state.localHash && snapshot.hash !== state.localHash;
-      if (localChanged) {
-        const duplicate = await findDuplicateClip(plainInputFromSnapshot(snapshot), snapshot.hash);
-        if (duplicate) {
-          const outcome = await promoteDuplicateClip(duplicate, snapshot.hash, group);
-          saveSyncState(groupID, {
-            ...state,
-            localHash: snapshot.hash,
-            localObservedAt: Date.now(),
-            remoteClipId: outcome.clip.id,
-            remoteHash: snapshot.hash
-          });
-          setPersistentNotice({ kind: 'info', message: saveOutcomeMessage(outcome, '剪贴板内容已同步') });
-          return;
-        }
-        await uploadClipboardSnapshot(snapshot, groupID);
-        return;
-      }
-    }
-
-    await copyRemoteClipToClipboard(latest, groupID);
-  }
-
-  async function uploadClipboardSnapshot(snapshot: ClipboardSnapshot, groupID: string) {
-    const group = activeGroup();
-    if (!group || group.id !== groupID) {
-      return;
-    }
-    const outcome = await addPlainBytes(plainInputFromSnapshot(snapshot));
-    const state = loadSyncState(groupID);
-    saveSyncState(groupID, {
-      ...state,
-      localHash: snapshot.hash,
-      localObservedAt: Date.now(),
-      remoteClipId: outcome.clip.id,
-      remoteHash: snapshot.hash
-    });
-    setPersistentNotice({ kind: 'info', message: saveOutcomeMessage(outcome, '已同步本机剪贴板') });
-  }
-
-  async function copyRemoteClipToClipboard(clip: ClipEntry, groupID: string) {
-    const group = activeGroup();
-    if (!group || group.id !== groupID) {
-      return;
-    }
-    if (clip.kind === 'file') {
-      setPersistentNotice({ kind: 'info', message: '最新内容是文件，浏览器不能自动写入系统剪贴板' });
-      return;
-    }
-    if (clip.kind === 'text' && !canWriteTextClipboard()) {
-      setPersistentNotice({ kind: 'error', message: '当前浏览器不支持自动写入文本剪贴板' });
-      return;
-    }
-    if (clip.kind === 'image' && !canWriteImageClipboard()) {
-      setPersistentNotice({ kind: 'info', message: '当前浏览器不支持自动写入图片剪贴板' });
-      return;
-    }
-    const state = loadSyncState(groupID);
-    const knownHash = clip.contentHash || (state.remoteClipId === clip.id ? state.remoteHash : undefined);
-    if (knownHash && state.remoteClipId === clip.id && state.localHash === knownHash) {
-      return;
-    }
-
-    const plain = await plainBytes(clip);
-    const hash = clip.contentHash || (await sha256Base64Url(plain));
-    if (state.remoteClipId === clip.id && state.localHash === hash) {
-      return;
-    }
-    const nav = requireClipboardAccess();
-    if (clip.kind === 'text') {
-      await nav.writeText(textDecoder.decode(plain));
-    } else if (clip.kind === 'image' && 'ClipboardItem' in window && typeof nav.write === 'function') {
-      await writeBinaryClipToClipboard(nav, clip, plain, hash);
-    } else {
-      setPersistentNotice({ kind: 'info', message: '当前浏览器不能自动写入图片剪贴板' });
-      return;
-    }
-
-    saveSyncState(groupID, {
-      ...state,
-      localHash: hash,
-      localObservedAt: clip.createdAt,
-      remoteClipId: clip.id,
-      remoteHash: hash,
-      remoteCopiedAt: Date.now()
-    });
-    setPersistentNotice({ kind: 'info', message: '已同步到系统剪贴板' });
-  }
-
   async function clipPlainHash(clip: ClipEntry) {
     return sha256Base64Url(await plainBytes(clip));
-  }
-
-  async function knownClipHash(clip: ClipEntry): Promise<string | null> {
-    if (clip.contentHash) {
-      return clip.contentHash;
-    }
-    if (clip.kind === 'file' || clip.size > legacyDedupeMaxBytes) {
-      return null;
-    }
-    try {
-      const contentHash = await clipPlainHash(clip);
-      const group = activeGroup();
-      if (group) {
-        await promoteDuplicateClip(clip, contentHash, group);
-      }
-      return contentHash;
-    } catch {
-      return null;
-    }
-  }
-
-  async function readClipboardSnapshot(): Promise<ClipboardSnapshot | null> {
-    const nav = requireClipboardAccess();
-    let richReadError: unknown;
-    if (typeof nav.read === 'function') {
-      try {
-        const items = await nav.read();
-        const appInput = await readAppClipboardInputFromItems(items);
-        if (appInput && appInput.source.bytes) {
-          return {
-            kind: appInput.kind,
-            bytes: appInput.source.bytes,
-            name: appInput.name,
-            mime: appInput.mime,
-            preview: appInput.preview,
-            hash: appInput.contentHash || (await sha256Base64Url(appInput.source.bytes))
-          };
-        }
-        for (const item of items) {
-          const imageType = item.types.find((type) => type.startsWith('image/'));
-          if (imageType) {
-            const blob = await item.getType(imageType);
-            const bytes = new Uint8Array(await blob.arrayBuffer());
-            return {
-              kind: 'image',
-              bytes,
-              name: `clipboard-${Date.now()}.${imageExtension(imageType)}`,
-              mime: imageType,
-              preview: '图片',
-              hash: await sha256Base64Url(bytes)
-            };
-          }
-        }
-        for (const item of items) {
-          if (item.types.includes('text/plain')) {
-            const blob = await item.getType('text/plain');
-            const text = await blob.text();
-            if (text.trim()) {
-              const bytes = textEncoder.encode(text);
-              return {
-                kind: 'text',
-                bytes,
-                name: '文本',
-                mime: 'text/plain;charset=utf-8',
-                preview: textPreview(text),
-                hash: await sha256Base64Url(bytes)
-              };
-            }
-          }
-        }
-      } catch (err) {
-        richReadError = err;
-      }
-    }
-
-    if (typeof nav.readText !== 'function') {
-      if (richReadError) {
-        throw richReadError;
-      }
-      throw new Error('当前浏览器不支持读取剪贴板');
-    }
-    const text = await nav.readText();
-    if (!text.trim()) {
-      return null;
-    }
-    const bytes = textEncoder.encode(text);
-    return {
-      kind: 'text',
-      bytes,
-      name: '文本',
-      mime: 'text/plain;charset=utf-8',
-      preview: textPreview(text),
-      hash: await sha256Base64Url(bytes)
-    };
   }
 
   async function downloadClip(clip: ClipEntry) {
@@ -1965,7 +1548,6 @@ export default function App() {
     }
     reconnectBlockedGroupID = group.id;
     closeIndexEvents();
-    clearQueuedClipboardSync();
     setPersistentNotice({ kind: 'error', message });
   }
 
@@ -1975,14 +1557,6 @@ export default function App() {
       return remoteClipboardUnavailableMessage;
     }
     return displayError(err);
-  }
-
-  function clipboardSyncOperationError(err: unknown) {
-    const group = activeGroup();
-    if (group && reconnectBlockedGroupID === group.id && isFatalAuthOrGroupError(err)) {
-      return remoteClipboardUnavailableMessage;
-    }
-    return clipboardSyncError(err);
   }
 
   function handlePaste(event: ClipboardEvent) {
@@ -2124,86 +1698,74 @@ export default function App() {
     plainCache.delete(plainCacheKey(groupID, clipID));
   }
 
-  function canCopyClip(clip: ClipEntry) {
-    if (clip.kind === 'text') {
-      return canWriteTextClipboard();
-    }
-    if (clip.kind === 'image' || clip.kind === 'file') {
-      return canWriteImageClipboard();
-    }
-    return false;
-  }
-
   return (
     <main class="app">
-      <Show when={unlocked()}>
-        <section class="workspace-toolbar" aria-label="剪贴板工具栏">
-          <select class="group-select" value={activeGroup()?.id || ''} disabled={busy()} aria-label="选择剪贴板" onChange={(event) => void switchGroup(event.currentTarget.value)}>
-            <For each={groups()}>{(group) => <option value={group.id}>{group.name}</option>}</For>
-          </select>
-          <span class={`live-indicator ${liveState()}`} title={liveStateLabel(liveState())} aria-label={liveStateLabel(liveState())} />
-          <div class="toolbar-actions">
-            <button class="icon-button" title="读取剪贴板" disabled={busy()} onClick={() => void readClipboard()}>
-              <ClipboardIcon size={18} />
-            </button>
-            <button class="icon-button" title="刷新" disabled={busy()} onClick={() => void refreshAndReconnect()}>
-              <CloudSync size={18} />
-            </button>
-            <label class={`icon-toggle ${clipboardSyncEnabled() ? 'enabled' : ''}`} title="同步">
-              <input
-                type="checkbox"
-                aria-label="同步"
-                checked={clipboardSyncEnabled()}
-                onChange={(event) => toggleClipboardSync(event.currentTarget.checked)}
-              />
-              <RefreshCw size={18} />
-            </label>
-            <label class={`icon-toggle ${clipboardNotifyEnabled() ? 'enabled' : ''}`} title={notificationToggleTitle()}>
-              <input
-                type="checkbox"
-                aria-label="通知"
-                checked={clipboardNotifyEnabled()}
-                onChange={(event) => void toggleClipboardNotification(event.currentTarget.checked)}
-              />
-              <Bell size={18} />
-            </label>
-            <Show when={busy() || syncing()}>
-              <span class="busy-indicator" title={busy() ? operationLabel() || '处理中' : '同步中'}>
-                <Loader2 class="spin" size={18} />
-              </span>
-            </Show>
-            <button class="icon-button" title="复制密钥" disabled={busy()} onClick={() => void copyInviteKey()}>
-              <Copy size={17} />
-            </button>
-            <button class="icon-button" title="密钥二维码" onClick={() => void showInviteCodeQR()}>
-              <QrCode size={17} />
-            </button>
-            <button class="icon-button danger" title="忘记密钥" onClick={removeActiveGroup}>
-              <Trash2 size={17} />
-            </button>
-            <Show when={installPrompt()}>
-              <button class="icon-button" title="安装应用" onClick={() => void installApp()}>
-                <Download size={18} />
-              </button>
-            </Show>
-            <Show when={serviceWorkerUpdateReady()}>
-              <button class="icon-button update-ready" title="更新应用" onClick={applyServiceWorkerUpdate}>
-                <RefreshCw size={18} />
-              </button>
-            </Show>
-            <button class="icon-button" title="关闭当前剪贴板" disabled={busy()} onClick={leaveGroup}>
-              <LogOut size={18} />
+      <header class="app-header">
+        <div class="header-main">
+          <h1><ClipboardIcon size={24} />OpenList Clipboard</h1>
+          <Show when={unlocked()}>
+            <div class="current-group">
+              <select class="group-select" value={activeGroup()?.id || ''} disabled={busy()} aria-label="选择剪贴板" onChange={(event) => void switchGroup(event.currentTarget.value)}>
+                <For each={groups()}>{(group) => <option value={group.id}>{group.name}</option>}</For>
+              </select>
+              <span class="live-status"><span class={`live-indicator ${liveState()}`} />{liveStateLabel(liveState())}</span>
+            </div>
+          </Show>
+        </div>
+        <Show when={unlocked()}>
+          <div class="notification-actions" role="group" aria-label="通知开关">
+            <button class={`icon-toggle ${clipboardNotifyEnabled() ? 'enabled' : ''}`} role="switch"
+              aria-checked={clipboardNotifyEnabled()} title={notificationToggleTitle()}
+              onClick={() => void toggleClipboardNotification(!clipboardNotifyEnabled())}>
+              <Bell size={18} /><span>{notificationToggleTitle()}</span>
+              <Show when={clipboardNotifyEnabled()} fallback={<ToggleLeft size={24} />}><ToggleRight size={24} /></Show>
             </button>
           </div>
-        </section>
-      </Show>
+        </Show>
+        <Show when={busy()}>
+          <span class="busy-indicator" role="status"><Loader2 class="spin" size={18} />{operationLabel() || '处理中'}</span>
+        </Show>
+        <Show when={persistentNotice()}>
+          <div class={`status-strip ${persistentNotice()!.kind}`} role="status">{persistentNotice()!.message}</div>
+        </Show>
+      </header>
 
-      <Show when={persistentNotice()}>
-        <div class={`status-strip ${persistentNotice()!.kind}`}>{persistentNotice()!.message}</div>
-      </Show>
+      <section class="workspace-toolbar" aria-label="剪贴板工具栏">
+        <Show when={unlocked()}>
+          <div class="toolbar-actions" role="group" aria-label="密钥">
+            <button class="icon-button" title="复制密钥" disabled={busy()} onClick={() => void copyInviteKey()}><Copy size={17} />复制密钥</button>
+            <button class="icon-button" title="密钥二维码" disabled={busy()} onClick={() => void showInviteCodeQR()}><QrCode size={17} />密钥二维码</button>
+            <button class="icon-button" title="增加密钥" disabled={busy()} onClick={leaveGroup}><Plus size={18} />增加密钥</button>
+            <button class="icon-button danger" title="忘记密钥" disabled={busy()} onClick={removeActiveGroup}><Trash2 size={17} />忘记密钥</button>
+          </div>
+        </Show>
+        <Show when={installPrompt() || serviceWorkerUpdateReady()}>
+          <div class="toolbar-actions app-actions" role="group" aria-label="应用">
+            <Show when={installPrompt()}>
+              <button class="icon-button" title="安装应用" onClick={() => void installApp()}><Download size={18} />安装应用</button>
+            </Show>
+            <Show when={serviceWorkerUpdateReady()}>
+              <button class="icon-button update-ready" title="更新应用" onClick={applyServiceWorkerUpdate}><RefreshCw size={18} />更新应用</button>
+            </Show>
+          </div>
+        </Show>
+      </section>
 
       <Show when={!unlocked()}>
         <section class="key-panel">
+          <Show when={groups().length > 0}>
+            <section class="saved-groups" aria-label="已保存剪贴板">
+              <h2>已保存剪贴板</h2>
+              <For each={groups()}>{(group) => (
+                <div class="saved-group">
+                  <strong>{group.name}</strong>
+                  <button class="secondary-button" disabled={busy() || !!cryptoUnavailable} onClick={() => void switchGroup(group.id)}>
+                    <ClipboardIcon size={17} />打开
+                  </button>
+                </div>
+              )}</For>
+            </section>
+          </Show>
           <Show when={cryptoUnavailable}>
             <p class="notice">{cryptoUnavailable}</p>
           </Show>
@@ -2265,20 +1827,23 @@ export default function App() {
             rows={4}
           />
           <div class="composer-actions">
-            <label class={`file-button icon-button ${busy() ? 'disabled' : ''}`} title="选择文件">
-              <Upload size={17} />
+            <label class={`file-button secondary-button ${busy() ? 'disabled' : ''}`} title="上传文件">
+              <Upload size={17} />上传文件
               <input
                 class="file-input"
                 type="file"
                 accept="*/*"
                 multiple
                 disabled={busy()}
-                aria-label="选择文件"
+                aria-label="上传文件"
                 onChange={(event) => handleFileInputChange(event.currentTarget)}
               />
             </label>
-            <button class="icon-button send-button" title="发送" aria-label="发送" onClick={() => void addText()} disabled={busy() || textDraft().trim().length === 0}>
-              <Send size={18} />
+            <button class="secondary-button" title="直接粘贴剪贴板" disabled={busy()} onClick={() => void readClipboard()}>
+              <ClipboardIcon size={18} />直接粘贴剪贴板
+            </button>
+            <button class="send-button" title="发送" aria-label="发送" onClick={() => void addText()} disabled={busy() || textDraft().trim().length === 0}>
+              <Send size={18} />发送
             </button>
           </div>
         </section>
@@ -2325,30 +1890,28 @@ export default function App() {
                     </Show>
                     <Show when={clip.kind === 'image' && previewUrls()[clip.id]}>
                       <button class="preview-button" type="button" title="查看大图" disabled={busy()} onClick={() => void openPreviewModal(clip)}>
-                        <img class="preview" src={previewUrls()[clip.id]} alt={clip.name} />
+                        <img class="preview" src={previewUrls()[clip.id]} alt={clip.name} /><span class="preview-caption"><Maximize2 size={17} />查看大图</span>
                       </button>
                     </Show>
                   </div>
                   <div class="clip-actions">
-                    <Show when={canCopyClip(clip)}>
-                      <button class="icon-button" title="复制" disabled={busy()} onClick={() => void copyClip(clip)}>
-                        <Copy size={17} />
-                      </button>
-                    </Show>
+                    <button class="icon-button" title="复制" disabled={busy()} onClick={() => void copyClip(clip)}>
+                      <Copy size={17} />复制
+                    </button>
                     <Show when={clip.kind === 'image'}>
                       <Show
                         when={previewUrls()[clip.id]}
                         fallback={
                           <button class="icon-button" title="预览" disabled={busy()} onClick={() => void previewClip(clip)}>
-                            <Eye size={17} />
+                            <Eye size={17} />预览
                           </button>
                         }
                       >
                         <button class="icon-button" title="查看大图" disabled={busy()} onClick={() => void openPreviewModal(clip)}>
-                          <Maximize2 size={17} />
+                          <Maximize2 size={17} />查看大图
                         </button>
                         <button class="icon-button" title="收起预览" disabled={busy()} onClick={() => collapsePreview(clip)}>
-                          <EyeOff size={17} />
+                          <EyeOff size={17} />收起预览
                         </button>
                       </Show>
                     </Show>
@@ -2359,19 +1922,19 @@ export default function App() {
                         disabled={busy()}
                         onClick={() => void toggleTextExpansion(clip)}
                       >
-                        <Show when={expandedText()[clip.id]} fallback={<Eye size={17} />}><EyeOff size={17} /></Show>
+                        <Show when={expandedText()[clip.id]} fallback={<Eye size={17} />}><EyeOff size={17} /></Show>{expandedText()[clip.id] ? '收起全文' : '展开全文'}
                       </button>
                     </Show>
                     <Show when={clip.kind !== 'text'}>
                       <button class="icon-button" title="下载" disabled={busy()} onClick={() => void downloadClip(clip)}>
-                        <Download size={17} />
+                        <Download size={17} />下载
                       </button>
                     </Show>
                     <button class="icon-button" title={clip.pinned ? '取消置顶' : '置顶'} disabled={busy()} onClick={() => void togglePin(clip)}>
-                      <Show when={clip.pinned} fallback={<Pin size={17} />}><PinOff size={17} /></Show>
+                      <Show when={clip.pinned} fallback={<Pin size={17} />}><PinOff size={17} /></Show>{clip.pinned ? '取消置顶' : '置顶'}
                     </button>
                     <button class="icon-button danger" title="删除" disabled={busy()} onClick={() => void removeClip(clip)}>
-                      <Trash2 size={17} />
+                      <Trash2 size={17} />删除
                     </button>
                   </div>
                 </article>
@@ -2387,7 +1950,7 @@ export default function App() {
             <div class="modal-head">
               <h2>剪贴板密钥二维码</h2>
               <button class="icon-button" title="关闭" onClick={() => setShowInviteQR(false)}>
-                <X size={17} />
+                <X size={17} />关闭
               </button>
             </div>
             <Show when={inviteQR()}>
@@ -2409,7 +1972,7 @@ export default function App() {
             <div class="modal-head">
               <h2>扫描剪贴板密钥</h2>
               <button class="icon-button" title="关闭" onClick={stopInviteScanner}>
-                <X size={17} />
+                <X size={17} />关闭
               </button>
             </div>
             <Show
@@ -2445,7 +2008,7 @@ export default function App() {
             <div class="modal-head">
               <h2>{previewModalClip()!.name || '图片预览'}</h2>
               <button class="icon-button" title="关闭" onClick={() => setPreviewModalClipId('')}>
-                <X size={17} />
+                <X size={17} />关闭
               </button>
             </div>
             <Show when={previewUrls()[previewModalClip()!.id]}>
@@ -2461,7 +2024,7 @@ export default function App() {
             <div class={`toast ${toast.kind}`}>
               <span>{toast.message}</span>
               <button class="toast-close" title="关闭提示" onClick={() => dismissToast(toast.id)}>
-                <X size={14} />
+                <X size={14} />关闭提示
               </button>
             </div>
           )}
@@ -2483,18 +2046,6 @@ async function readPlainInput(input: PlainClipInput): Promise<Uint8Array> {
   } catch {
     throw new Error(`无法读取文件：${input.name || '未命名文件'}。请确认文件仍在本机且未被占用。`);
   }
-}
-
-function plainInputFromSnapshot(snapshot: ClipboardSnapshot): PlainClipInput {
-  return {
-    source: { bytes: snapshot.bytes },
-    size: snapshot.bytes.byteLength,
-    kind: snapshot.kind,
-    name: snapshot.name,
-    mime: snapshot.mime,
-    preview: snapshot.preview,
-    contentHash: snapshot.hash
-  };
 }
 
 async function readPlainInputChunk(input: PlainClipInput, offset: number, size: number): Promise<Uint8Array> {
@@ -2614,30 +2165,6 @@ function isTyping() {
   return ['INPUT', 'TEXTAREA', 'SELECT'].includes(element.tagName) || (element as HTMLElement).isContentEditable;
 }
 
-function clipboardFilesFromPaste(event: ClipboardEvent): File[] {
-  const data = event.clipboardData;
-  if (!data) {
-    return [];
-  }
-  const files = [...data.files].map((file) => normalizePastedFile(file));
-  if (files.length > 0) {
-    return files;
-  }
-  return [...data.items]
-    .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
-    .map((item) => {
-      const file = item.getAsFile();
-      if (!file) {
-        return null;
-      }
-      if (file.name) {
-        return file;
-      }
-      return normalizePastedFile(file, item.type);
-    })
-    .filter((file): file is File => file !== null);
-}
-
 function textPreview(text: string) {
   return text.slice(0, maxTextPreviewChars);
 }
@@ -2646,224 +2173,16 @@ function isCompleteTextPreview(clip: ClipEntry) {
   return clip.kind === 'text' && clip.size <= textEncoder.encode(clip.preview || '').byteLength;
 }
 
-function clipboardContainsAppPayload(data: DataTransfer | null | undefined) {
-  if (!data) {
-    return false;
-  }
-  return [...data.types].some((type) => isAppClipboardPayloadType(type));
-}
-
-function isAppClipboardPayloadType(type: string) {
-  return type === appClipboardPayloadClipboardType || type === appClipboardPayloadBlobMime;
-}
-
-function normalizePastedFile(file: File, itemMime = ''): File {
-  if (file.name) {
-    return file;
-  }
-  const mime = file.type || itemMime || 'application/octet-stream';
-  const name = mime.startsWith('image/')
-    ? `clipboard-${Date.now()}.${imageExtension(mime)}`
-    : `clipboard-${Date.now()}.bin`;
-  return new File([file], name, {
-    type: mime,
-    lastModified: file.lastModified || Date.now()
-  });
-}
-
-function canAttemptForegroundSync() {
-  return document.visibilityState === 'visible' && document.hasFocus();
-}
-
-function canWriteTextClipboard() {
-  return typeof navigator.clipboard?.writeText === 'function';
-}
-
-function canWriteImageClipboard() {
-  const clipboard = navigator.clipboard as (Clipboard & { write?: (items: ClipboardItem[]) => Promise<void> }) | undefined;
-  return typeof ClipboardItem !== 'undefined' && typeof clipboard?.write === 'function';
-}
-
-function clipboardEventTarget(): (EventTarget & {
-  addEventListener: EventTarget['addEventListener'];
-  removeEventListener: EventTarget['removeEventListener'];
-}) | null {
-  const clipboard = navigator.clipboard as unknown as
-    | (EventTarget & {
-        addEventListener?: EventTarget['addEventListener'];
-        removeEventListener?: EventTarget['removeEventListener'];
-      })
-    | undefined;
-  if (!clipboard || typeof clipboard.addEventListener !== 'function' || typeof clipboard.removeEventListener !== 'function') {
-    return null;
-  }
-  return clipboard as EventTarget & {
-    addEventListener: EventTarget['addEventListener'];
-    removeEventListener: EventTarget['removeEventListener'];
-  };
-}
-
-function requireClipboardAccess(): Clipboard & {
-  read?: () => Promise<ClipboardItem[]>;
-} {
+function requireClipboardAccess(): RichClipboard {
   if (!navigator.clipboard) {
     throw new Error('当前浏览器未开放剪贴板能力，请使用 HTTPS 或 localhost 访问。');
   }
-  return navigator.clipboard as RichClipboard;
+  return navigator.clipboard;
 }
 
 async function sha256Base64Url(bytes: Uint8Array) {
   const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', bytesToArrayBuffer(bytes)));
   return bytesToBase64Url(hash);
-}
-
-async function tryReadAppClipboardInput(): Promise<PlainClipInput | null> {
-  const nav = navigator.clipboard as RichClipboard | undefined;
-  if (!nav || typeof nav.read !== 'function') {
-    return null;
-  }
-  try {
-    return await readAppClipboardInputFromItems(await nav.read());
-  } catch {
-    return null;
-  }
-}
-
-async function readAppClipboardInput(): Promise<PlainClipInput> {
-  const input = await tryReadAppClipboardInput();
-  if (!input) {
-    throw new Error('当前剪贴板不是本应用复制的数据。');
-  }
-  return input;
-}
-
-async function readAppClipboardInputFromItems(items: ClipboardItem[]): Promise<PlainClipInput | null> {
-  for (const item of items) {
-    const type = item.types.find((value) => isAppClipboardPayloadType(value));
-    if (!type) {
-      continue;
-    }
-    try {
-      const payload = await item.getType(type);
-      const input = await readAppClipboardPayload(payload);
-      if (input) {
-        return input;
-      }
-    } catch {
-      // Ignore unreadable custom formats and fall back to the browser-provided data.
-    }
-  }
-  return null;
-}
-
-async function readAppClipboardPayload(payload: Blob): Promise<PlainClipInput | null> {
-  const bytes = new Uint8Array(await payload.arrayBuffer());
-  const magicLength = appClipboardPayloadMagicBytes.byteLength;
-  if (bytes.byteLength < magicLength + 4) {
-    return null;
-  }
-  for (let i = 0; i < magicLength; i += 1) {
-    if (bytes[i] !== appClipboardPayloadMagicBytes[i]) {
-      return null;
-    }
-  }
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const headerLength = view.getUint32(magicLength, false);
-  const headerStart = magicLength + 4;
-  const headerEnd = headerStart + headerLength;
-  if (headerEnd > bytes.byteLength) {
-    return null;
-  }
-  let header: Partial<AppClipboardPayloadHeader>;
-  try {
-    header = JSON.parse(textDecoder.decode(bytes.subarray(headerStart, headerEnd))) as Partial<AppClipboardPayloadHeader>;
-  } catch {
-    return null;
-  }
-  if (header.app !== 'openlist-clipboard' || header.version !== 1 || (header.kind !== 'image' && header.kind !== 'file')) {
-    return null;
-  }
-  const plain = bytes.subarray(headerEnd);
-  if (typeof header.size === 'number' && header.size !== plain.byteLength) {
-    return null;
-  }
-  const name = typeof header.name === 'string' && header.name ? header.name : header.kind === 'image' ? '图片' : '文件';
-  const mime = typeof header.mime === 'string' && header.mime ? header.mime : header.kind === 'image' ? 'image/png' : 'application/octet-stream';
-  const contentHash = await sha256Base64Url(plain);
-  return {
-    source: { bytes: plain.slice() },
-    size: plain.byteLength,
-    kind: header.kind,
-    name,
-    mime,
-    preview: header.kind === 'image' ? '图片' : '文件',
-    contentHash
-  };
-}
-
-async function buildAppClipboardPayload(clip: ClipEntry, plain: Uint8Array, contentHash: string): Promise<Blob> {
-  const header: AppClipboardPayloadHeader = {
-    app: 'openlist-clipboard',
-    version: 1,
-    kind: clip.kind === 'image' ? 'image' : 'file',
-    name: clip.name || (clip.kind === 'image' ? '图片' : '文件'),
-    mime: clip.mime || (clip.kind === 'image' ? 'image/png' : 'application/octet-stream'),
-    size: plain.byteLength,
-    contentHash
-  };
-  const headerBytes = textEncoder.encode(JSON.stringify(header));
-  const framed = new Uint8Array(appClipboardPayloadMagicBytes.byteLength + 4 + headerBytes.byteLength + plain.byteLength);
-  framed.set(appClipboardPayloadMagicBytes, 0);
-  new DataView(framed.buffer).setUint32(appClipboardPayloadMagicBytes.byteLength, headerBytes.byteLength, false);
-  framed.set(headerBytes, appClipboardPayloadMagicBytes.byteLength + 4);
-  framed.set(plain, appClipboardPayloadMagicBytes.byteLength + 4 + headerBytes.byteLength);
-  return new Blob([bytesToArrayBuffer(framed)], { type: appClipboardPayloadBlobMime });
-}
-
-async function writeBinaryClipToClipboard(
-  nav: RichClipboard,
-  clip: ClipEntry,
-  plain: Uint8Array,
-  contentHash: string
-): Promise<'exact' | 'fallback'> {
-  if (typeof nav.write !== 'function' || typeof ClipboardItem === 'undefined') {
-    throw new Error(clip.kind === 'image' ? '当前浏览器不支持复制图片到系统剪贴板。' : '当前浏览器不支持复制文件到系统剪贴板。');
-  }
-  const binaryMime = clip.mime || (clip.kind === 'image' ? 'image/png' : 'application/octet-stream');
-  const binaryBlob = new Blob([bytesToArrayBuffer(plain)], { type: binaryMime });
-  const payloadBlob = await buildAppClipboardPayload(clip, plain, contentHash);
-  try {
-    if (clip.kind === 'image') {
-      await nav.write([
-        new ClipboardItem({
-          [appClipboardPayloadClipboardType]: payloadBlob,
-          [binaryMime]: binaryBlob
-        })
-      ]);
-    } else {
-      await nav.write([
-        new ClipboardItem({
-          [appClipboardPayloadClipboardType]: payloadBlob
-        })
-      ]);
-    }
-    return 'exact';
-  } catch (err) {
-    if (clip.kind === 'image') {
-      try {
-        await nav.write([new ClipboardItem({ [binaryMime]: binaryBlob })]);
-        return 'fallback';
-      } catch (fallbackErr) {
-        throw new Error(`复制图片失败：${displayError(fallbackErr)}`);
-      }
-    }
-    throw new Error(`复制文件失败：${displayError(err)}`);
-  }
-}
-
-function imageExtension(mime: string) {
-  const subtype = mime.split('/')[1]?.split('+')[0]?.replace(/[^A-Za-z0-9_-]/g, '');
-  return subtype || 'png';
 }
 
 function notificationPermissionState(): NotificationSupportState {
@@ -2907,30 +2226,6 @@ function webPushAvailability(): { available: boolean; reason?: string } {
     };
   }
   return { available: true };
-}
-
-async function setAppBadge(count: number) {
-  const nav = navigator as Navigator & { setAppBadge?: (count?: number) => Promise<void> };
-  if (typeof nav.setAppBadge !== 'function') {
-    return;
-  }
-  try {
-    await nav.setAppBadge(count);
-  } catch {
-    // App badge support varies by browser and user settings.
-  }
-}
-
-async function clearAppBadge() {
-  const nav = navigator as Navigator & { clearAppBadge?: () => Promise<void> };
-  if (typeof nav.clearAppBadge !== 'function') {
-    return;
-  }
-  try {
-    await nav.clearAppBadge();
-  } catch {
-    // App badge support varies by browser and user settings.
-  }
 }
 
 function isIOSSafari() {
@@ -2983,14 +2278,6 @@ function saveNotificationEnabled(groupID: string, enabled: boolean) {
   saveGroupFlag(notificationEnabledStorageKey, groupID, enabled);
 }
 
-function loadSyncEnabled(groupID: string) {
-  return loadGroupFlag(syncEnabledStorageKey, groupID);
-}
-
-function saveSyncEnabled(groupID: string, enabled: boolean) {
-  saveGroupFlag(syncEnabledStorageKey, groupID, enabled);
-}
-
 function loadGroupFlag(storageKey: string, groupID: string) {
   return readStorageObject(storageKey)[groupID] === true;
 }
@@ -3003,26 +2290,6 @@ function saveGroupFlag(storageKey: string, groupID: string, enabled: boolean) {
     delete current[groupID];
   }
   writeStorageObject(storageKey, current);
-}
-
-function loadSyncState(groupID: string): StoredSyncState {
-  const state = readStorageObject(syncStateStorageKey)[groupID];
-  if (!state || typeof state !== 'object' || Array.isArray(state)) {
-    return {};
-  }
-  return state as StoredSyncState;
-}
-
-function saveSyncState(groupID: string, state: StoredSyncState) {
-  const current = readStorageObject(syncStateStorageKey);
-  current[groupID] = {
-    localHash: state.localHash,
-    localObservedAt: state.localObservedAt,
-    remoteClipId: state.remoteClipId,
-    remoteHash: state.remoteHash,
-    remoteCopiedAt: state.remoteCopiedAt
-  };
-  writeStorageObject(syncStateStorageKey, current);
 }
 
 function readStorageObject(key: string): Record<string, unknown> {
@@ -3044,13 +2311,6 @@ function writeStorageObject(key: string, value: Record<string, unknown>) {
   } catch {
     // Local storage can be unavailable in private browsing or strict site settings.
   }
-}
-
-function clipboardSyncError(err: unknown) {
-  if (err instanceof DOMException && (err.name === 'NotAllowedError' || err.name === 'SecurityError')) {
-    return '浏览器拒绝剪贴板同步。请确认页面在前台，并允许此站点读取/写入剪贴板。';
-  }
-  return displayError(err);
 }
 
 function displayError(err: unknown) {
