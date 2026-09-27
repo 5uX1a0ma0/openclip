@@ -241,6 +241,35 @@ function textInput(text: string): PlainClipInput | null {
   return { source: { bytes }, size: bytes.byteLength, kind: 'text', name: '文本', mime: 'text/plain;charset=utf-8', preview: text.slice(0, 160) };
 }
 
+export async function writeTextClipToClipboard(nav: RichClipboard, loadText: () => Promise<string>): Promise<void> {
+  if (!nav.writeText && (!nav.write || typeof ClipboardItem === 'undefined')) {
+    throw new Error('当前浏览器不支持复制文本。');
+  }
+  const pending = loadText();
+  // A permission rejection can arrive before a download/decryption finishes.
+  void pending.catch(() => undefined);
+  let item: ClipboardItem | undefined;
+  if (nav.write && typeof ClipboardItem !== 'undefined') {
+    const blob = pending.then((text) => new Blob([text], { type: 'text/plain' }));
+    void blob.catch(() => undefined);
+    try { item = new ClipboardItem({ 'text/plain': blob }); } catch { /* Use writeText if promise items are unsupported. */ }
+  }
+  try {
+    if (item && nav.write) {
+      // Reserve user activation in the click handler, before asynchronous decryption.
+      await nav.write([item]);
+      await pending;
+    } else if (nav.writeText) {
+      await nav.writeText(await pending);
+    } else {
+      throw new Error('unsupported');
+    }
+  } catch {
+    await pending; // Preserve content loading errors and make retries use the cached plaintext.
+    throw new Error('复制失败，请允许剪贴板写入后重试。');
+  }
+}
+
 export async function writeBinaryClipToClipboard(
   nav: RichClipboard,
   clip: ClipEntry,

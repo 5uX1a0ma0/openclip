@@ -56,7 +56,8 @@ import {
   readAppClipboardInput,
   readSystemClipboardInput,
   tryReadAppClipboardInput,
-  writeBinaryClipToClipboard
+  writeBinaryClipToClipboard,
+  writeTextClipToClipboard
 } from './clipboard';
 import { clearAppBadge, setAppBadge, clearLegacySyncStorage } from './platform';
 import { runOrderedChunkPipeline } from './chunk_pipeline';
@@ -87,6 +88,7 @@ import {
 } from './groups';
 import { decodeQRCodeFromCanvas, qrCodeDataURL } from './qr';
 import { closeSha256Worker, sha256BlobFast } from './sha256_worker_client';
+import { cleanTrackingLinks } from './tracking_links';
 import type { ActiveGroup, ClipChunk, ClipEntry, ClipIndex, IndexEvent, RuntimeConfig, SavedGroup } from './types';
 
 const textEncoder = new TextEncoder();
@@ -100,6 +102,7 @@ const defaultChunkPlainBytes = 4 * 1024 * 1024;
 const chunkedEncryption = 'aes-gcm-chunked-v1';
 const cryptoUnavailable = webCryptoUnavailableReason();
 const notificationEnabledStorageKey = 'openlist-clipboard.notify.enabled.v1';
+const cleanBeforeUploadStorageKey = 'openlist-clipboard.clean-before-upload.v1';
 const clientIdStorageKey = 'openlist-clipboard.client-id.v1';
 const scannerMaxEdge = 640;
 const scannerScanIntervalMs = 120;
@@ -157,6 +160,7 @@ export default function App() {
   const [index, setIndex] = createSignal<ClipIndex>(emptyIndex());
   const [baseHash, setBaseHash] = createSignal('');
   const [textDraft, setTextDraft] = createSignal('');
+  const [cleanBeforeUpload, setCleanBeforeUpload] = createSignal(loadCleanBeforeUpload());
   const [busy, setBusy] = createSignal(false);
   const [operationLabel, setOperationLabel] = createSignal('');
   const [persistentNotice, setPersistentNotice] = createSignal<PersistentNotice | null>(null);
@@ -188,6 +192,9 @@ export default function App() {
   let scannerFrame = 0;
   let scannerDone = false;
   let scannerLastScanAt = 0;
+  let scannerRequestID = 0;
+  let modalOpener: HTMLElement | null = null;
+  let pendingModalFocus: HTMLElement | null = null;
   let indexStream: IndexStream | null = null;
   let indexEventsVersion = 0;
   let reconnectBlockedGroupID = '';
@@ -225,6 +232,7 @@ export default function App() {
     return visibleText;
   });
   const previewModalClip = createMemo(() => activeClips().find((clip) => clip.id === previewModalClipId()) || null);
+  const activeModal = createMemo(() => showInviteQR() ? 'qr' : scannerOpen() ? 'scanner' : previewModalClip() ? 'image' : '');
   const createFormHint = createMemo(() => {
     if (cryptoUnavailable) {
       return '';
@@ -296,6 +304,77 @@ export default function App() {
     }
     connectIndexEvents(group);
   });
+
+  createEffect(() => {
+    const modal = activeModal();
+    if (!modal) return;
+    const opener = modalOpener || (document.activeElement instanceof HTMLElement ? document.activeElement : null);
+    const previousOverflow = document.documentElement.style.overflow;
+    document.documentElement.style.overflow = 'hidden';
+    let closed = false;
+    queueMicrotask(() => {
+      if (!closed) document.querySelector<HTMLElement>(`.modal-panel[data-modal="${modal}"]`)?.focus();
+    });
+    function handleModalKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeModal(modal);
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const panel = document.querySelector<HTMLElement>(`.modal-panel[data-modal="${modal}"]`);
+      const items = [...(panel?.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), [tabindex]:not([tabindex="-1"])') || [])];
+      if (!items.length) { event.preventDefault(); panel?.focus(); return; }
+      if (event.shiftKey && (document.activeElement === items[0] || document.activeElement === panel)) {
+        event.preventDefault(); items[items.length - 1].focus();
+      } else if (!event.shiftKey && document.activeElement === items[items.length - 1]) {
+        event.preventDefault(); items[0].focus();
+      }
+    }
+    function keepModalFocus(event: FocusEvent) {
+      const panel = document.querySelector<HTMLElement>(`.modal-panel[data-modal="${modal}"]`);
+      if (panel && event.target instanceof Node && !panel.contains(event.target)) panel.focus();
+    }
+    document.addEventListener('keydown', handleModalKeyDown);
+    document.addEventListener('focusin', keepModalFocus);
+    onCleanup(() => {
+      closed = true;
+      document.removeEventListener('keydown', handleModalKeyDown);
+      document.removeEventListener('focusin', keepModalFocus);
+      document.documentElement.style.overflow = previousOverflow;
+      modalOpener = null;
+      if (opener?.isConnected) {
+        pendingModalFocus = opener;
+        queueMicrotask(restoreModalFocus);
+      }
+    });
+  });
+
+  createEffect(() => {
+    if (!busy()) queueMicrotask(restoreModalFocus);
+  });
+
+  function restoreModalFocus() {
+    if (activeModal()) return;
+    const target = pendingModalFocus;
+    if (!target?.isConnected) {
+      pendingModalFocus = null;
+      return;
+    }
+    if (target.matches(':disabled')) return;
+    pendingModalFocus = null;
+    target.focus();
+  }
+
+  function closeModal(modal: string) {
+    if (modal === 'qr') setShowInviteQR(false);
+    if (modal === 'scanner') stopInviteScanner();
+    if (modal === 'image') setPreviewModalClipId('');
+  }
+
+  function rememberModalOpener() {
+    if (!activeModal()) modalOpener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  }
 
   createEffect(() => {
     const group = activeGroup();
@@ -514,6 +593,7 @@ export default function App() {
   }
 
   async function showInviteCodeQR() {
+    rememberModalOpener();
     const group = requireGroup();
     await run(async () => {
       setInviteQR(await qrCodeDataURL(group.invite));
@@ -536,11 +616,15 @@ export default function App() {
       showToast(cryptoUnavailable, 'error');
       return;
     }
+    rememberModalOpener();
+    const requestID = ++scannerRequestID;
     await run(async () => {
+      stopInviteScannerStream();
       setScannedInvite('');
       setScannerOpen(true);
       try {
         await nextAnimationFrame();
+        if (!scannerOpen() || requestID !== scannerRequestID) return false;
         if (!scannerVideo || !scannerCanvas) {
           throw new Error('二维码扫描器尚未就绪。');
         }
@@ -549,14 +633,20 @@ export default function App() {
         }
         scannerDone = false;
         scannerLastScanAt = 0;
-        scannerStream = await navigator.mediaDevices.getUserMedia({
+        const stream = await navigator.mediaDevices.getUserMedia({
           video: { facingMode: { ideal: 'environment' } },
           audio: false
         });
+        if (!scannerOpen() || requestID !== scannerRequestID) {
+          stream.getTracks().forEach((track) => track.stop());
+          return false;
+        }
+        scannerStream = stream;
         scannerVideo.srcObject = scannerStream;
         await scannerVideo.play();
         scannerFrame = requestAnimationFrame(scanInviteFrame);
       } catch (err) {
+        if (requestID !== scannerRequestID) return false;
         stopInviteScanner();
         throw err;
       }
@@ -601,6 +691,7 @@ export default function App() {
   }
 
   function stopInviteScanner() {
+    scannerRequestID += 1;
     stopInviteScannerStream();
     setScannerOpen(false);
     setScannedInvite('');
@@ -879,7 +970,35 @@ export default function App() {
   }
 
   async function addPlainBytes(input: PlainClipInput): Promise<SaveOutcome> {
+    if (cleanBeforeUpload() && input.kind === 'text') {
+      const original = textDecoder.decode(await readPlainInput(input));
+      const cleaned = cleanTrackingLinks(original).text;
+      if (cleaned !== original) {
+        const bytes = textEncoder.encode(cleaned);
+        input = { ...input, source: { bytes }, size: bytes.byteLength, preview: textPreview(cleaned), contentHash: undefined };
+      }
+    }
     return saveOrPromoteClip(input);
+  }
+
+  function toggleCleanBeforeUpload() {
+    const enabled = !cleanBeforeUpload();
+    setCleanBeforeUpload(enabled);
+    try { localStorage.setItem(cleanBeforeUploadStorageKey, enabled ? 'true' : 'false'); } catch { /* Session state still works. */ }
+  }
+
+  async function copyCleanText(loadText: () => Promise<string>) {
+    await run(async () => {
+      const nav = requireClipboardAccess();
+      let result = cleanTrackingLinks('');
+      await writeTextClipToClipboard(nav, async () => {
+        result = cleanTrackingLinks(await loadText());
+        return result.text;
+      });
+      return result.removedParams
+        ? `已净化复制：清理 ${result.changedLinks} 个链接、${result.removedParams} 个参数`
+        : '未发现跟踪参数，已复制原文';
+    }, '已复制', '复制中');
   }
 
   function normalizedChunkSize() {
@@ -1101,8 +1220,7 @@ export default function App() {
     await run(async () => {
       const nav = requireClipboardAccess();
       if (clip.kind === 'text') {
-        if (!nav.writeText) throw new Error('当前浏览器不支持复制文本。');
-        await nav.writeText(textDecoder.decode(await plainBytes(clip)));
+        await writeTextClipToClipboard(nav, async () => textDecoder.decode(await plainBytes(clip)));
         return;
       }
       const mode = await writeBinaryClipToClipboard(nav, clip, () => plainBytes(clip));
@@ -1388,6 +1506,7 @@ export default function App() {
     if (clip.kind !== 'image') {
       return;
     }
+    rememberModalOpener();
     await run(async () => {
       await ensurePreviewUrl(clip);
       setPreviewModalClipId(clip.id);
@@ -1606,12 +1725,12 @@ export default function App() {
     event.preventDefault();
   }
 
-  async function run(action: () => Promise<string | void>, ok: string, label = '处理中') {
+  async function run(action: () => Promise<string | false | void>, ok: string, label = '处理中') {
     setBusy(true);
     setOperationLabel(label);
     try {
       const result = await action();
-      showToast(result || ok, 'success');
+      if (result !== false) showToast(result || ok, 'success');
     } catch (err) {
       showToast(displayOperationError(err), 'error');
     } finally {
@@ -1699,10 +1818,11 @@ export default function App() {
   }
 
   return (
-    <main class="app">
+    <main class="app" id="main-content">
+      <a class="skip-link" href="#workspace">跳到工作区</a>
       <header class="app-header">
         <div class="header-main">
-          <h1><ClipboardIcon size={24} />OpenList Clipboard</h1>
+          <h1><ClipboardIcon aria-hidden="true" size={24} />OpenList Clipboard</h1>
           <Show when={unlocked()}>
             <div class="current-group">
               <select class="group-select" value={activeGroup()?.id || ''} disabled={busy()} aria-label="选择剪贴板" onChange={(event) => void switchGroup(event.currentTarget.value)}>
@@ -1717,13 +1837,13 @@ export default function App() {
             <button class={`icon-toggle ${clipboardNotifyEnabled() ? 'enabled' : ''}`} role="switch"
               aria-checked={clipboardNotifyEnabled()} title={notificationToggleTitle()}
               onClick={() => void toggleClipboardNotification(!clipboardNotifyEnabled())}>
-              <Bell size={18} /><span>{notificationToggleTitle()}</span>
-              <Show when={clipboardNotifyEnabled()} fallback={<ToggleLeft size={24} />}><ToggleRight size={24} /></Show>
+              <Bell aria-hidden="true" size={18} /><span>{notificationToggleTitle()}</span>
+              <Show when={clipboardNotifyEnabled()} fallback={<ToggleLeft aria-hidden="true" size={24} />}><ToggleRight aria-hidden="true" size={24} /></Show>
             </button>
           </div>
         </Show>
         <Show when={busy()}>
-          <span class="busy-indicator" role="status"><Loader2 class="spin" size={18} />{operationLabel() || '处理中'}</span>
+          <span class="busy-indicator" role="status"><Loader2 aria-hidden="true" class="spin" size={18} />{operationLabel() || '处理中'}</span>
         </Show>
         <Show when={persistentNotice()}>
           <div class={`status-strip ${persistentNotice()!.kind}`} role="status">{persistentNotice()!.message}</div>
@@ -1733,26 +1853,26 @@ export default function App() {
       <section class="workspace-toolbar" aria-label="剪贴板工具栏">
         <Show when={unlocked()}>
           <div class="toolbar-actions" role="group" aria-label="密钥">
-            <button class="icon-button" title="复制密钥" disabled={busy()} onClick={() => void copyInviteKey()}><Copy size={17} />复制密钥</button>
-            <button class="icon-button" title="密钥二维码" disabled={busy()} onClick={() => void showInviteCodeQR()}><QrCode size={17} />密钥二维码</button>
-            <button class="icon-button" title="增加密钥" disabled={busy()} onClick={leaveGroup}><Plus size={18} />增加密钥</button>
-            <button class="icon-button danger" title="忘记密钥" disabled={busy()} onClick={removeActiveGroup}><Trash2 size={17} />忘记密钥</button>
+            <button class="icon-button" title="复制密钥" disabled={busy()} onClick={() => void copyInviteKey()}><Copy aria-hidden="true" size={17} />复制密钥</button>
+            <button class="icon-button" title="密钥二维码" disabled={busy()} onClick={() => void showInviteCodeQR()}><QrCode aria-hidden="true" size={17} />密钥二维码</button>
+            <button class="icon-button" title="增加密钥" disabled={busy()} onClick={leaveGroup}><Plus aria-hidden="true" size={18} />增加密钥</button>
+            <button class="icon-button danger" title="忘记密钥" disabled={busy()} onClick={removeActiveGroup}><Trash2 aria-hidden="true" size={17} />忘记密钥</button>
           </div>
         </Show>
         <Show when={installPrompt() || serviceWorkerUpdateReady()}>
           <div class="toolbar-actions app-actions" role="group" aria-label="应用">
             <Show when={installPrompt()}>
-              <button class="icon-button" title="安装应用" onClick={() => void installApp()}><Download size={18} />安装应用</button>
+              <button class="icon-button" title="安装应用" onClick={() => void installApp()}><Download aria-hidden="true" size={18} />安装应用</button>
             </Show>
             <Show when={serviceWorkerUpdateReady()}>
-              <button class="icon-button update-ready" title="更新应用" onClick={applyServiceWorkerUpdate}><RefreshCw size={18} />更新应用</button>
+              <button class="icon-button update-ready" title="更新应用" onClick={applyServiceWorkerUpdate}><RefreshCw aria-hidden="true" size={18} />更新应用</button>
             </Show>
           </div>
         </Show>
       </section>
 
       <Show when={!unlocked()}>
-        <section class="key-panel">
+        <section class="key-panel" id="workspace" tabIndex={-1}>
           <Show when={groups().length > 0}>
             <section class="saved-groups" aria-label="已保存剪贴板">
               <h2>已保存剪贴板</h2>
@@ -1760,7 +1880,7 @@ export default function App() {
                 <div class="saved-group">
                   <strong>{group.name}</strong>
                   <button class="secondary-button" disabled={busy() || !!cryptoUnavailable} onClick={() => void switchGroup(group.id)}>
-                    <ClipboardIcon size={17} />打开
+                    <ClipboardIcon aria-hidden="true" size={17} />打开
                   </button>
                 </div>
               )}</For>
@@ -1772,6 +1892,7 @@ export default function App() {
           <form class="group-form" onSubmit={createGroupAction}>
             <div class="form-title">创建剪贴板</div>
             <input
+              aria-label="剪贴板名称" name="group-name"
               value={groupName()}
               onInput={(event) => setGroupName(event.currentTarget.value)}
               placeholder="剪贴板名称"
@@ -1779,6 +1900,7 @@ export default function App() {
               required
             />
             <input
+              aria-label="创建密码" name="create-password"
               type="password"
               value={createPassword()}
               onInput={(event) => setCreatePassword(event.currentTarget.value)}
@@ -1787,7 +1909,7 @@ export default function App() {
               required
             />
             <button type="submit" disabled={busy() || !canCreateGroup()}>
-              <Plus size={17} />
+              <Plus aria-hidden="true" size={17} />
               创建剪贴板
             </button>
             <Show when={createFormHint()}>
@@ -1797,6 +1919,7 @@ export default function App() {
           <form class="group-form import-form" onSubmit={importGroupAction}>
             <div class="form-title">加入已有剪贴板</div>
             <textarea
+              aria-label="剪贴板密钥" name="invite-key" autocomplete="off"
               value={inviteInput()}
               onInput={(event) => setInviteInput(event.currentTarget.value)}
               placeholder="粘贴 olckey1 剪贴板密钥"
@@ -1805,11 +1928,11 @@ export default function App() {
             />
             <div class="composer-actions">
               <button type="button" onClick={() => void startInviteScanner()} disabled={busy() || !!cryptoUnavailable}>
-                <Camera size={17} />
+                <Camera aria-hidden="true" size={17} />
                 扫描
               </button>
               <button type="submit" disabled={busy() || !!cryptoUnavailable || inviteInput().trim().length === 0}>
-                <Upload size={17} />
+                <Upload aria-hidden="true" size={17} />
                 加入剪贴板
               </button>
             </div>
@@ -1818,17 +1941,30 @@ export default function App() {
       </Show>
 
       <Show when={unlocked()}>
-        <section class="composer">
+        <section class="composer" id="workspace" tabIndex={-1}>
           <textarea
+            id="composer-text"
+            aria-label="要发送的文本" name="clip-text" autocomplete="off"
             value={textDraft()}
             onInput={(event) => setTextDraft(event.currentTarget.value)}
             onKeyDown={handleComposerKeyDown}
             placeholder="粘贴文本"
             rows={4}
           />
+          <div class="composer-tools" role="group" aria-label="链接清理">
+            <button class="text-tool" type="button" title="净化复制" disabled={busy() || !textDraft()}
+              onClick={() => void copyCleanText(async () => textDraft())}>
+              <Copy aria-hidden="true" size={16} />净化复制
+            </button>
+            <button class={`clean-toggle ${cleanBeforeUpload() ? 'enabled' : ''}`} type="button" role="switch"
+              aria-checked={cleanBeforeUpload()} title="上传前清理链接" onClick={toggleCleanBeforeUpload}>
+              <span>上传前清理链接</span>
+              <Show when={cleanBeforeUpload()} fallback={<ToggleLeft aria-hidden="true" size={23} />}><ToggleRight aria-hidden="true" size={23} /></Show>
+            </button>
+          </div>
           <div class="composer-actions">
             <label class={`file-button secondary-button ${busy() ? 'disabled' : ''}`} title="上传文件">
-              <Upload size={17} />上传文件
+              <Upload aria-hidden="true" size={17} />上传文件
               <input
                 class="file-input"
                 type="file"
@@ -1840,10 +1976,10 @@ export default function App() {
               />
             </label>
             <button class="secondary-button" title="直接粘贴剪贴板" disabled={busy()} onClick={() => void readClipboard()}>
-              <ClipboardIcon size={18} />直接粘贴剪贴板
+              <ClipboardIcon aria-hidden="true" size={18} />直接粘贴剪贴板
             </button>
             <button class="send-button" title="发送" aria-label="发送" onClick={() => void addText()} disabled={busy() || textDraft().trim().length === 0}>
-              <Send size={18} />发送
+              <Send aria-hidden="true" size={18} />发送
             </button>
           </div>
         </section>
@@ -1856,9 +1992,9 @@ export default function App() {
                   <div class="clip-icon">
                     <Show
                       when={clip.kind === 'text'}
-                      fallback={<Show when={clip.kind === 'image'} fallback={<FileIcon size={19} />}><ImageIcon size={19} /></Show>}
+                      fallback={<Show when={clip.kind === 'image'} fallback={<FileIcon aria-hidden="true" size={19} />}><ImageIcon aria-hidden="true" size={19} /></Show>}
                     >
-                      <FileText size={19} />
+                      <FileText aria-hidden="true" size={19} />
                     </Show>
                   </div>
                   <div class="clip-main">
@@ -1877,7 +2013,7 @@ export default function App() {
                       </Show>
                       <Show when={textPreviewState()[clip.id]?.loading}>
                         <div class="text-expanded-state">
-                          <Loader2 class="spin" size={14} />
+                          <Loader2 aria-hidden="true" class="spin" size={14} />
                           解密中
                         </div>
                       </Show>
@@ -1890,28 +2026,34 @@ export default function App() {
                     </Show>
                     <Show when={clip.kind === 'image' && previewUrls()[clip.id]}>
                       <button class="preview-button" type="button" title="查看大图" disabled={busy()} onClick={() => void openPreviewModal(clip)}>
-                        <img class="preview" src={previewUrls()[clip.id]} alt={clip.name} /><span class="preview-caption"><Maximize2 size={17} />查看大图</span>
+                        <img class="preview" src={previewUrls()[clip.id]} alt={clip.name} width="360" height="260" /><span class="preview-caption"><Maximize2 aria-hidden="true" size={17} />查看大图</span>
                       </button>
                     </Show>
                   </div>
                   <div class="clip-actions">
                     <button class="icon-button" title="复制" disabled={busy()} onClick={() => void copyClip(clip)}>
-                      <Copy size={17} />复制
+                      <Copy aria-hidden="true" size={17} />复制
                     </button>
+                    <Show when={clip.kind === 'text'}>
+                      <button class="icon-button" title="净化复制" disabled={busy()}
+                        onClick={() => void copyCleanText(async () => textDecoder.decode(await plainBytes(clip)))}>
+                        <Copy aria-hidden="true" size={17} />净化复制
+                      </button>
+                    </Show>
                     <Show when={clip.kind === 'image'}>
                       <Show
                         when={previewUrls()[clip.id]}
                         fallback={
                           <button class="icon-button" title="预览" disabled={busy()} onClick={() => void previewClip(clip)}>
-                            <Eye size={17} />预览
+                            <Eye aria-hidden="true" size={17} />预览
                           </button>
                         }
                       >
                         <button class="icon-button" title="查看大图" disabled={busy()} onClick={() => void openPreviewModal(clip)}>
-                          <Maximize2 size={17} />查看大图
+                          <Maximize2 aria-hidden="true" size={17} />查看大图
                         </button>
                         <button class="icon-button" title="收起预览" disabled={busy()} onClick={() => collapsePreview(clip)}>
-                          <EyeOff size={17} />收起预览
+                          <EyeOff aria-hidden="true" size={17} />收起预览
                         </button>
                       </Show>
                     </Show>
@@ -1922,19 +2064,19 @@ export default function App() {
                         disabled={busy()}
                         onClick={() => void toggleTextExpansion(clip)}
                       >
-                        <Show when={expandedText()[clip.id]} fallback={<Eye size={17} />}><EyeOff size={17} /></Show>{expandedText()[clip.id] ? '收起全文' : '展开全文'}
+                        <Show when={expandedText()[clip.id]} fallback={<Eye aria-hidden="true" size={17} />}><EyeOff aria-hidden="true" size={17} /></Show>{expandedText()[clip.id] ? '收起全文' : '展开全文'}
                       </button>
                     </Show>
                     <Show when={clip.kind !== 'text'}>
                       <button class="icon-button" title="下载" disabled={busy()} onClick={() => void downloadClip(clip)}>
-                        <Download size={17} />下载
+                        <Download aria-hidden="true" size={17} />下载
                       </button>
                     </Show>
                     <button class="icon-button" title={clip.pinned ? '取消置顶' : '置顶'} disabled={busy()} onClick={() => void togglePin(clip)}>
-                      <Show when={clip.pinned} fallback={<Pin size={17} />}><PinOff size={17} /></Show>{clip.pinned ? '取消置顶' : '置顶'}
+                      <Show when={clip.pinned} fallback={<Pin aria-hidden="true" size={17} />}><PinOff aria-hidden="true" size={17} /></Show>{clip.pinned ? '取消置顶' : '置顶'}
                     </button>
                     <button class="icon-button danger" title="删除" disabled={busy()} onClick={() => void removeClip(clip)}>
-                      <Trash2 size={17} />删除
+                      <Trash2 aria-hidden="true" size={17} />删除
                     </button>
                   </div>
                 </article>
@@ -1945,20 +2087,20 @@ export default function App() {
       </Show>
 
       <Show when={showInviteQR()}>
-        <div class="modal-backdrop" onClick={() => setShowInviteQR(false)}>
-          <section class="modal-panel qr-panel" onClick={(event) => event.stopPropagation()}>
+        <div class="modal-backdrop" onClick={() => closeModal('qr')}>
+          <section class="modal-panel qr-panel" data-modal="qr" role="dialog" aria-modal="true" aria-labelledby="qr-title" tabIndex={-1} onClick={(event) => event.stopPropagation()}>
             <div class="modal-head">
-              <h2>剪贴板密钥二维码</h2>
-              <button class="icon-button" title="关闭" onClick={() => setShowInviteQR(false)}>
-                <X size={17} />关闭
+              <h2 id="qr-title">剪贴板密钥二维码</h2>
+              <button class="icon-button" title="关闭" onClick={() => closeModal('qr')}>
+                <X aria-hidden="true" size={17} />关闭
               </button>
             </div>
             <Show when={inviteQR()}>
-              <img class="qr-image" src={inviteQR()} alt="剪贴板密钥二维码" />
+              <img class="qr-image" src={inviteQR()} alt="剪贴板密钥二维码" width="320" height="320" />
             </Show>
             <div class="qr-actions">
               <button onClick={() => void copyInviteKey()}>
-                <Copy size={17} />
+                <Copy aria-hidden="true" size={17} />
                 复制密钥
               </button>
             </div>
@@ -1967,12 +2109,12 @@ export default function App() {
       </Show>
 
       <Show when={scannerOpen()}>
-        <div class="modal-backdrop" onClick={stopInviteScanner}>
-          <section class="modal-panel scanner-panel" onClick={(event) => event.stopPropagation()}>
+        <div class="modal-backdrop" onClick={() => closeModal('scanner')}>
+          <section class="modal-panel scanner-panel" data-modal="scanner" role="dialog" aria-modal="true" aria-labelledby="scanner-title" tabIndex={-1} onClick={(event) => event.stopPropagation()}>
             <div class="modal-head">
-              <h2>扫描剪贴板密钥</h2>
-              <button class="icon-button" title="关闭" onClick={stopInviteScanner}>
-                <X size={17} />关闭
+              <h2 id="scanner-title">扫描剪贴板密钥</h2>
+              <button class="icon-button" title="关闭" onClick={() => closeModal('scanner')}>
+                <X aria-hidden="true" size={17} />关闭
               </button>
             </div>
             <Show
@@ -1988,11 +2130,11 @@ export default function App() {
                 <div class="scanner-key mono">{scannedInvite()}</div>
                 <div class="qr-actions">
                   <button type="button" disabled={busy()} onClick={() => void joinScannedInvite()}>
-                    <Upload size={17} />
+                    <Upload aria-hidden="true" size={17} />
                     加入剪贴板
                   </button>
                   <button type="button" class="secondary-button" disabled={busy()} onClick={() => void startInviteScanner()}>
-                    <Camera size={17} />
+                    <Camera aria-hidden="true" size={17} />
                     重新扫描
                   </button>
                 </div>
@@ -2003,28 +2145,28 @@ export default function App() {
       </Show>
 
       <Show when={previewModalClip()}>
-        <div class="modal-backdrop image-backdrop" onClick={() => setPreviewModalClipId('')}>
-          <section class="modal-panel image-panel" onClick={(event) => event.stopPropagation()}>
+        <div class="modal-backdrop image-backdrop" onClick={() => closeModal('image')}>
+          <section class="modal-panel image-panel" data-modal="image" role="dialog" aria-modal="true" aria-labelledby="image-title" tabIndex={-1} onClick={(event) => event.stopPropagation()}>
             <div class="modal-head">
-              <h2>{previewModalClip()!.name || '图片预览'}</h2>
-              <button class="icon-button" title="关闭" onClick={() => setPreviewModalClipId('')}>
-                <X size={17} />关闭
+              <h2 id="image-title">{previewModalClip()!.name || '图片预览'}</h2>
+              <button class="icon-button" title="关闭" onClick={() => closeModal('image')}>
+                <X aria-hidden="true" size={17} />关闭
               </button>
             </div>
             <Show when={previewUrls()[previewModalClip()!.id]}>
-              <img class="image-preview-large" src={previewUrls()[previewModalClip()!.id]} alt={previewModalClip()!.name || '图片预览'} />
+              <img class="image-preview-large" src={previewUrls()[previewModalClip()!.id]} alt={previewModalClip()!.name || '图片预览'} width="960" height="720" />
             </Show>
           </section>
         </div>
       </Show>
 
-      <div class="toast-stack">
+      <div class="toast-stack" aria-live="polite" aria-atomic="false">
         <For each={toasts()}>
           {(toast) => (
             <div class={`toast ${toast.kind}`}>
               <span>{toast.message}</span>
               <button class="toast-close" title="关闭提示" onClick={() => dismissToast(toast.id)}>
-                <X size={14} />关闭提示
+                <X aria-hidden="true" size={14} />关闭提示
               </button>
             </div>
           )}
@@ -2137,6 +2279,10 @@ function loadClientId() {
   } catch {
     return randomCacheToken();
   }
+}
+
+function loadCleanBeforeUpload() {
+  try { return localStorage.getItem(cleanBeforeUploadStorageKey) === 'true'; } catch { return false; }
 }
 
 function saveOutcomeMessage(outcome: SaveOutcome, createdMessage: string) {

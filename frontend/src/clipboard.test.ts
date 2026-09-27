@@ -7,7 +7,8 @@ import {
   readAppClipboardPayload,
   readSystemClipboardInput,
   tryReadAppClipboardInput,
-  writeBinaryClipToClipboard
+  writeBinaryClipToClipboard,
+  writeTextClipToClipboard
 } from './clipboard';
 import type { ClipEntry } from './types';
 
@@ -27,6 +28,26 @@ const item = (data: Record<string, Blob | Promise<Blob>>) => new Item(data) as u
 
 beforeEach(() => { Item.supports.mockReturnValue(true); vi.stubGlobal('ClipboardItem', Item); });
 afterEach(() => vi.unstubAllGlobals());
+
+describe('text clipboard', () => {
+  it('reserves user activation before a delayed text download completes', async () => {
+    let resolve!: (text: string) => void;
+    const loaded = new Promise<string>((done) => { resolve = done; });
+    const write = vi.fn(async (items: ClipboardItem[]) => { expect(await (await items[0].getType('text/plain')).text()).toBe('complete text'); });
+    const pending = writeTextClipToClipboard({ write }, () => loaded);
+    expect(write).toHaveBeenCalledOnce();
+    resolve('complete text');
+    await pending;
+  });
+
+  it('supports writeText-only browsers and reports permission and decryption failures', async () => {
+    const writeText = vi.fn(async () => {});
+    await writeTextClipToClipboard({ writeText }, async () => 'text');
+    expect(writeText).toHaveBeenCalledWith('text');
+    await expect(writeTextClipToClipboard({ writeText: async () => { throw new Error('denied'); } }, async () => 'text')).rejects.toThrow('重试');
+    await expect(writeTextClipToClipboard({ write: async () => { throw new Error('denied'); } }, async () => { throw new Error('decrypt failed'); })).rejects.toThrow('decrypt failed');
+  });
+});
 
 describe('binary clipboard', () => {
   it.each([file, image])('writes original MIME and exact app data for $kind', async (clip) => {
